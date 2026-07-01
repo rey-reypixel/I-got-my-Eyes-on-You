@@ -1,1 +1,49 @@
+#Very clean, very mindful, very demure✨
+# (☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)
+# 1. Editor & OS Specific (VS Code)
+.vscode/
+.history/
+*.code-workspace
+.DS_Store
+Thumbs.db
 
+# (☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)
+# 2. Python & Environment Cleanliness
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.env
+.venv
+venv/
+ENV/
+
+# (☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)
+# 3. AI Models & Large Weights 
+*.pt
+*.pth
+*.onnx
+*.engine
+*.weights
+models/checkpoint*/
+
+# (☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)
+# 4. Data & Video Datasets Guard rails
+data/raw/
+data/sample_videos/
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.zip
+*.tar.gz
+*.rar
+
+# EXCEPTIONS: Keep documentation visible
+!data/README.md
+!data/**/README.md
+
+# (☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)
+# 5. Local Notebooks & Benchmarks Logs
+benchmarks/logs/
+.ipynb_checkpoints/
