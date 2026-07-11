@@ -28,6 +28,7 @@ def update_tracking_states(yolo_results: Any, polygon_vertices: List[Tuple[float
         boxes = getattr(result.boxes, "xywh", None)
         confs = getattr(result.boxes, "conf", None)
         labels = getattr(result.boxes, "cls", None)
+        track_ids = getattr(result.boxes, "id", None)
         if boxes is None:
             continue
 
@@ -35,9 +36,10 @@ def update_tracking_states(yolo_results: Any, polygon_vertices: List[Tuple[float
             x_center, y_center, width, height = map(float, box)
             confidence = float(confs[index]) if confs is not None and len(confs) > index else 0.0
             label = int(labels[index]) if labels is not None and len(labels) > index else -1
+            track_id = int(track_ids[index]) if track_ids is not None and len(track_ids) > index else index
             detections.append(
                 {
-                    "person_id": index,
+                    "person_id": track_id,
                     "x_center": x_center,
                     "y_center": y_center,
                     "width": width,

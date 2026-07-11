@@ -100,7 +100,7 @@ class MultiModelDetectionEngine:
         confidence: float = 0.25,
         imgsz: int = 640,
     ) -> None:
-        self.source = source or str(Path("data/sample_videos"))
+        self.source = source or "data/sample_videos/your_video.mp4"
         self.model_path = model_path or "yolov8n.pt"
         self.device = device
         self.confidence = confidence
@@ -134,45 +134,71 @@ class MultiModelDetectionEngine:
             raise RuntimeError("cv2 is required to process frames")
         return cv2.resize(frame, (self.imgsz, self.imgsz), interpolation=cv2.INTER_AREA)
 
+    @staticmethod
+    def _overlay_color(state_label: str) -> tuple[int, int, int]:
+        if state_label in {"WARNING", "ABANDONED", "PANIC", "INTRUDER"}:
+            return (0, 0, 255)
+        return (0, 255, 0)
+
     def _run_inference(self, frame: Any) -> Any:
         model = self.load_model()
-        return model(frame, stream=True, conf=self.confidence, imgsz=self.imgsz, device=self.device)
+        return model.track(
+            frame,
+            persist=True,
+            tracker="bytetrack.yaml",
+            conf=self.confidence,
+            imgsz=self.imgsz,
+            device=self.device,
+        )
 
     def _route_tracking_updates(self, frame: Any, results: Any, timestamp: float) -> None:
         """Synchronize detections into the in-memory tracking structures."""
         update_tracking_states(results, self.roi_polygon, th_frames=10)
 
+        if cv2 is None or frame is None:
+            return
+
         for result in results:
             boxes = getattr(result.boxes, "xywh", None)
             confs = getattr(result.boxes, "conf", None)
+            labels = getattr(result.boxes, "cls", None)
+            track_ids = getattr(result.boxes, "id", None)
             if boxes is None:
                 continue
 
             for index, box in enumerate(boxes):
                 x_center, y_center, width, height = map(float, box)
-                person_id = index
+                person_id = int(track_ids[index]) if track_ids is not None and len(track_ids) > index else index
                 confidence = float(confs[index]) if confs is not None and len(confs) > index else 0.0
+                label = int(labels[index]) if labels is not None and len(labels) > index else -1
 
-                if cv2 is not None and frame is not None:
-                    state_label = tracked_people[person_id].get("state", "NORMAL") if person_id in tracked_people else "NORMAL"
-                    bag_state = tracked_bags[person_id].get("state", "ATTENDED") if person_id in tracked_bags else "ATTENDED"
-                    cv2.putText(
-                        frame,
-                        f"P{person_id}:{confidence:.2f}|{state_label}|{bag_state}",
-                        (int(x_center), int(y_center)),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5,
-                        (0, 255, 0),
-                        2,
-                    )
+                state_label = tracked_people[person_id].get("state", "NORMAL") if person_id in tracked_people else "NORMAL"
+                bag_state = tracked_bags[person_id].get("state", "ATTENDED") if person_id in tracked_bags else "ATTENDED"
+                color = self._overlay_color(state_label)
+
+                x1 = int(x_center - width / 2.0)
+                y1 = int(y_center - height / 2.0)
+                x2 = int(x_center + width / 2.0)
+                y2 = int(y_center + height / 2.0)
+
+                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+                cv2.putText(
+                    frame,
+                    f"ID:{person_id} {label} | {state_label} | {bag_state}",
+                    (x1, max(y1 - 5, 0)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    color,
+                    2,
+                )
 
     def run(self) -> None:
         """Drive the live inference loop from a video source."""
         self.initialize_stream()
         try:
-            while True:
-                ok, frame = self.capture.read()  # type: ignore[union-attr]
-                if not ok or frame is None:
+            while self.capture.isOpened():
+                ret, frame = self.capture.read()  # type: ignore[union-attr]
+                if not ret or frame is None:
                     break
 
                 timestamp = time.time()
