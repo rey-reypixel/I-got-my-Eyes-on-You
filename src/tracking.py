@@ -115,4 +115,57 @@ def update_tracking_states(yolo_results: Any, polygon_vertices: List[Tuple[float
             process_abandoned_logic(bag_id, tracked_bags[bag_id], person_coords, th_frames)
 
 
-__all__ = ["update_tracking_states"]
+def process_tracking_state_machine(
+    yolo_results: Any,
+    frame_id: int,
+    polygon_vertices: Optional[List[Tuple[float, float]]] = None,
+    th_frames: int = 10,
+) -> List[Dict[str, Any]]:
+    """Return a list of metric dictionaries for benchmark logging and downstream analytics."""
+    if polygon_vertices is None:
+        polygon_vertices = []
+
+    update_tracking_states(yolo_results, polygon_vertices, th_frames=th_frames)
+
+    custom_metrics: List[Dict[str, Any]] = []
+    if yolo_results is None:
+        return custom_metrics
+
+    for result in yolo_results:
+        boxes = getattr(result.boxes, "xywh", None)
+        labels = getattr(result.boxes, "cls", None)
+        track_ids = getattr(result.boxes, "id", None)
+        if boxes is None:
+            continue
+
+        names = getattr(result, "names", None)
+        for index, _box in enumerate(boxes):
+            track_id = int(track_ids[index]) if track_ids is not None and len(track_ids) > index else index
+            label_index = int(labels[index]) if labels is not None and len(labels) > index else -1
+            class_label = str(label_index)
+            if names is not None:
+                try:
+                    class_label = names.get(label_index, str(label_index))  # type: ignore[union-attr]
+                except AttributeError:
+                    class_label = str(label_index)
+
+            state = tracked_people.get(track_id, {}).get("state", "NORMAL") if track_id in tracked_people else "NORMAL"
+            owner_id = None
+            if track_id in tracked_bags:
+                owner_id = tracked_bags[track_id].get("owner_id")
+
+            custom_metrics.append(
+                {
+                    "frame_id": frame_id,
+                    "object_id": track_id,
+                    "class_label": class_label,
+                    "assigned_owner_id": owner_id,
+                    "current_state": state,
+                    "threat_alert_triggered": state in {"PANIC", "WARNING", "ABANDONED"},
+                }
+            )
+
+    return custom_metrics
+
+
+__all__ = ["update_tracking_states", "process_tracking_state_machine"]
