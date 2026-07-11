@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -17,15 +18,75 @@ except ImportError:  # pragma: no cover - depends on runtime environment
     YOLO = None
 
 from .state_machine import (
-    append_behavioral_confidence,
-    behavioral_smoothing_buffer_lock,
-    register_bag,
-    register_person,
     tracked_bags,
-    tracked_bags_lock,
     tracked_people,
-    tracked_people_lock,
 )
+from .tracking import update_tracking_states
+
+
+def is_inside_polygon(x_person: float, y_person: float, polygon_vertices: list) -> bool:
+    """Evaluate whether a tracked foot coordinate falls inside a slanted ROI polygon."""
+    intersect_count = 0
+    num_vertices = len(polygon_vertices)
+
+    for i in range(num_vertices):
+        A = polygon_vertices[i]
+        B = polygon_vertices[(i + 1) % num_vertices]
+
+        if (A[1] <= y_person < B[1]) or (B[1] <= y_person < A[1]):
+            if x_person < min(A[0], B[0]):
+                intersect_count += 1
+            elif x_person > max(A[0], B[0]):
+                continue
+            else:
+                x_intersection = A[0] + ((y_person - A[1]) * (B[0] - A[0])) / (B[1] - A[1])
+                if x_person <= x_intersection:
+                    intersect_count += 1
+
+    return intersect_count % 2 != 0
+
+
+def process_abandoned_logic(bag_id: int, bag_state: dict, person_coords: tuple, th_frames: int):
+    """Manage temporal abandoned-object state transitions with proximity hysteresis."""
+    D_DISCONNECT = 50.0
+    D_RECONNECT = 30.0
+
+    d = math.sqrt((person_coords[0] - bag_state["center_coords"][0]) ** 2 + (person_coords[1] - bag_state["center_coords"][1]) ** 2)
+
+    if bag_state["state"] == "ATTENDED":
+        if d > D_DISCONNECT:
+            bag_state["state"] = "WARNING"
+            bag_state["timer"] = 1
+    elif bag_state["state"] in ("WARNING", "ABANDONED"):
+        if d < D_RECONNECT:
+            bag_state["state"] = "ATTENDED"
+            bag_state["timer"] = 0
+        elif bag_state["state"] == "WARNING":
+            bag_state["timer"] += 1
+            if bag_state["timer"] >= th_frames:
+                bag_state["state"] = "ABANDONED"
+
+
+def calculate_normalized_kinematics(current_box: tuple, previous_box: tuple) -> float:
+    """Compute invariant body-height normalized motion for perspective stabilization."""
+    x_t, y_t, h_t = current_box
+    x_prev, y_prev, _ = previous_box
+
+    pixel_displacement = math.sqrt((x_t - x_prev) ** 2 + (y_t - y_prev) ** 2)
+    return pixel_displacement / h_t
+
+
+def verify_panic_anomaly(velocity_history: list, threshold_devs: float = 3.0) -> bool:
+    """Detect acceleration spikes from a rolling velocity window."""
+    if len(velocity_history) < 5:
+        return False
+
+    v_current = velocity_history[-1]
+    v_historical = velocity_history[:-1]
+    mean_v = sum(v_historical) / len(v_historical)
+    if v_current > (mean_v * threshold_devs):
+        return True
+    return False
 
 
 class MultiModelDetectionEngine:
@@ -46,6 +107,12 @@ class MultiModelDetectionEngine:
         self.imgsz = imgsz
         self.model: Optional[Any] = None
         self.capture: Optional[Any] = None
+        self.roi_polygon = [
+            (0.1 * self.imgsz, 0.1 * self.imgsz),
+            (0.9 * self.imgsz, 0.15 * self.imgsz),
+            (0.95 * self.imgsz, 0.85 * self.imgsz),
+            (0.2 * self.imgsz, 0.9 * self.imgsz),
+        ]
 
     def load_model(self) -> Any:
         if YOLO is None:
@@ -73,6 +140,8 @@ class MultiModelDetectionEngine:
 
     def _route_tracking_updates(self, frame: Any, results: Any, timestamp: float) -> None:
         """Synchronize detections into the in-memory tracking structures."""
+        update_tracking_states(results, self.roi_polygon, th_frames=10)
+
         for result in results:
             boxes = getattr(result.boxes, "xywh", None)
             confs = getattr(result.boxes, "conf", None)
@@ -84,30 +153,12 @@ class MultiModelDetectionEngine:
                 person_id = index
                 confidence = float(confs[index]) if confs is not None and len(confs) > index else 0.0
 
-                with tracked_people_lock:
-                    tracked_people.setdefault(
-                        person_id,
-                        {
-                            "path_history": [],
-                            "velocities": [],
-                            "state": "NORMAL",
-                            "panic_counter": 0,
-                        },
-                    )
-                    tracked_people[person_id]["path_history"].append((x_center, y_center))
-                    if len(tracked_people[person_id]["path_history"]) > 30:
-                        tracked_people[person_id]["path_history"].pop(0)
-
-                with tracked_bags_lock:
-                    tracked_bags.setdefault(person_id, {"owner_id": person_id, "center_coords": (x_center, y_center), "state": "ATTENDED", "timer": 0})
-                    tracked_bags[person_id]["center_coords"] = (x_center, y_center)
-
-                append_behavioral_confidence(person_id, confidence)
-
                 if cv2 is not None and frame is not None:
+                    state_label = tracked_people[person_id].get("state", "NORMAL") if person_id in tracked_people else "NORMAL"
+                    bag_state = tracked_bags[person_id].get("state", "ATTENDED") if person_id in tracked_bags else "ATTENDED"
                     cv2.putText(
                         frame,
-                        f"P{person_id}:{confidence:.2f}",
+                        f"P{person_id}:{confidence:.2f}|{state_label}|{bag_state}",
                         (int(x_center), int(y_center)),
                         cv2.FONT_HERSHEY_SIMPLEX,
                         0.5,
