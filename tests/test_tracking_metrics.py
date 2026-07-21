@@ -28,6 +28,38 @@ class TrackingMetricsTests(unittest.TestCase):
         self.assertIn(metrics[0]["current_state"], {"NORMAL", "PANIC"})
         self.assertFalse(metrics[0]["threat_alert_triggered"])
 
+    def test_process_behavioral_smoothing(self):
+        reset_state()
+        from src.state_machine import tracked_people
+        from src.tracking import process_behavioral_smoothing
+
+        tracked_people[1] = {
+            "state": "NORMAL",
+        }
+
+        config = {
+            "behavioral_smoothing": {
+                "window_size": 3,
+                "activation_threshold": 0.8,
+                "beta": 0.8
+            }
+        }
+
+        # 1. First frame - score 0.9 -> initial EMA is 0.9 >= 0.8 -> SUSPICIOUS_ACTIVITY
+        process_behavioral_smoothing(1, 0.9, config)
+        self.assertEqual(tracked_people[1]["state"], "SUSPICIOUS_ACTIVITY")
+        self.assertAlmostEqual(tracked_people[1]["anomaly_score_ema"], 0.9)
+
+        # 2. Second frame - score 0.5 -> EMA becomes 0.8 * 0.9 + 0.2 * 0.5 = 0.82 >= 0.8 -> remains SUSPICIOUS_ACTIVITY (persistency!)
+        process_behavioral_smoothing(1, 0.5, config)
+        self.assertEqual(tracked_people[1]["state"], "SUSPICIOUS_ACTIVITY")
+        self.assertAlmostEqual(tracked_people[1]["anomaly_score_ema"], 0.82)
+
+        # 3. Third frame - score 0.5 -> EMA becomes 0.8 * 0.82 + 0.2 * 0.5 = 0.756 < 0.8 -> transitions to NORMAL
+        process_behavioral_smoothing(1, 0.5, config)
+        self.assertEqual(tracked_people[1]["state"], "NORMAL")
+        self.assertAlmostEqual(tracked_people[1]["anomaly_score_ema"], 0.756)
+
 
 if __name__ == "__main__":
     unittest.main()
