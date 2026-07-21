@@ -14,7 +14,7 @@ def check_required_packages() -> bool:
     Defensively validates the import integrity of the core tech stack.
     Returns True if all modules load successfully; False otherwise.
     """
-    required_packages = ["torch", "cv2", "ultralytics"]
+    required_packages = ["torch", "cv2", "ultralytics", "mcp"]
     
     for package in required_packages:
         try:
