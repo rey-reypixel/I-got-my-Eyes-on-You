@@ -1,0 +1,368 @@
+I-GOT-MY-EYES-ON-YOU
+====================
+Project Overview
+----------------
+Project Name: I-got-my-Eyes-on-You
+Purpose: Build an AI-powered CCTV surveillance system that can detect suspicious activities, unauthorized access, and abandoned objects in video streams.
+
+The project is a summer internship prototype focused on creating an intelligent monitoring pipeline that can analyze video frames, track people and objects, assign behavioral states, and log results for evaluation.
+
+Why This Project Was Built
+--------------------------
+- To reduce the need for constant human monitoring in CCTV systems.
+- To make surveillance more intelligent by combining object detection, tracking, and state-based reasoning.
+- To explore how AI can support threat understanding in security footage.
+- To build a modular system that can be improved later with better datasets, models, and thresholds.
+
+Project Goal
+------------
+The goal was to create a working proof-of-concept pipeline that can:
+- read video input,
+- detect people and objects,
+- track identities across frames,
+- identify suspicious or risky states,
+- log telemetry for performance assessment.
+
+What We Did
+-----------
+1. Built the project structure and repository layout.
+2. Added the core Python package modules under the src/ folder.
+3. Implemented video inference and frame processing logic.
+4. Integrated object detection with Ultralytics YOLO.
+5. Added tracking-based state management for people and bags.
+6. Implemented engineering-layer logic for:
+   - unauthorized access detection using polygon-based region analysis,
+   - abandoned-object detection using hysteresis-based temporal logic,
+   - suspicious-activity detection using normalized motion and anomaly checks.
+7. Added benchmark scripts for baseline and custom evaluation.
+8. Added metrics reporting utilities to summarize performance.
+9. Added tests for the metrics and tracking pipeline.
+10. Verified the workflow using a sample VIRAT video.
+
+Project Architecture
+--------------------
+The system follows a simple AI video-analysis pipeline:
+
+Input Video
+  -> Frame extraction
+  -> YOLO object detection
+  -> Object tracking (ByteTrack)
+  -> Tracking state update layer
+  -> Engineering-layer reasoning
+  -> Visual overlays and telemetry export
+
+Main Code Modules
+-----------------
+- src/detection.py
+  - Main detection engine
+  - Handles video opening, frame resizing, inference, and visualization
+  - Contains helper functions for polygon containment, abandoned-object logic, kinematics, and panic detection
+
+- src/tracking.py
+  - Orchestrates frame-by-frame tracking updates
+  - Converts detections into tracking state updates
+  - Maintains person and bag state information
+
+- src/state_machine.py
+  - Stores in-memory state for tracked people, bags, and behavioral confidence history
+  - Implements thread-safe state containers
+
+- src/engineering_layers.py
+  - Connects the main reasoning functions to the tracking pipeline
+
+- benchmark/baseline_eval.py
+  - Runs baseline YOLO tracking evaluation and exports telemetry logs
+
+- benchmark/custom_eval.py
+  - Runs the project-specific state-machine-enhanced evaluation and exports telemetry logs
+
+- metrics_report/summarize_metrics.py
+  - Reads benchmark CSV logs and produces a summary table
+
+- src/event_log.py
+  - SQLite-backed persisted event log: every alert/state-change transition during a
+    main.py run (when started with --event-log <path>) is recorded here
+  - Read/write API used by both MultiModelDetectionEngine and mcp_server/server.py
+
+- mcp_server/server.py
+  - Standalone MCP server (official `mcp` Python SDK) exposing read-only query tools
+    over src/event_log.py's SQLite database: list_runs, list_alerts, get_track_history,
+    get_run_summary. Decoupled from the live video pipeline -- it only ever reads the
+    database file, never shares a process or thread with the OpenCV loop.
+
+- tests/
+  - Contains regression tests for metrics and tracking state handling
+
+What the System Tries to Detect
+-------------------------------
+1. Suspicious activities
+   - Based on motion patterns and anomaly detection
+   - Uses normalized kinematics and panic-style acceleration checks
+   - Uses focal height-normalized displacement spikes (SUSPICIOUS_ACTIVITY state) compensating for perspective expansion
+   - Gated pose-based limb-motion check: when a tracked person's centroid has been
+     near-stationary for a sustained window (stationary_counter), a second model
+     (yolov8n-pose.pt) is invoked on that frame to catch the case centroid motion
+     alone cannot see -- a person standing still while limbs move violently
+     (fighting, vandalism, shoplifting). The signal is the rolling variance of
+     wrist/elbow keypoints relative to a torso reference point, height-normalized
+     and confidence-gated per keypoint, smoothed via the same EMA used for the
+     rest of the behavioral state and combined into SUSPICIOUS_ACTIVITY alongside
+     the kinematic-spike flag. Because it only runs when gated in, it does not
+     pay inference cost on every person every frame.
+
+2. Unauthorized access
+   - Based on whether a tracked person enters a defined polygon/region of interest
+   - The ROI is defined by polygon vertices in the detection engine
+
+3. Abandoned objects
+   - Tracks bags or assets and determines if they are left unattended for too long
+   - Uses state transitions such as ATTENDED -> WARNING -> ABANDONED
+   - Applies dynamically stretched vertical proximity constraints to prevent false abandoned warnings for owners standing next to bags on the floor
+
+Core Logic Details
+------------------
+- The pipeline builds per-person tracking memory.
+- Each tracked entity stores path history, velocity history, state label, panic counter, and previous frame centroid coordinate history.
+- Bags are tracked separately with temporal state attributes such as owner_id, center coordinates, current state, and timer.
+- The system checks closest human keys and stretches proximity constraints to handle vertical height offsets.
+- The system uses simple state-machine logic to interpret what is happening to each object in the scene.
+
+Important Implementation Concepts
+--------------------------------
+1. Object Detection
+   - Uses YOLOv8n as the base detector.
+   - Inference is performed on each frame.
+
+2. Tracking
+   - Uses Ultralytics tracking with ByteTrack persistence.
+   - Track IDs are preserved across frames.
+
+3. State Reasoning
+   - Each tracked person carries independent per-detector flags (intruder_flag,
+     panic_flag, kinematic_suspicious_flag, limb_suspicious_flag), each with its
+     own recovery condition, instead of one field multiple detectors could
+     silently overwrite. The single displayed label is resolved once per frame
+     from a fixed priority order: INTRUDER > PANIC > SUSPICIOUS_ACTIVITY > NORMAL
+     (src/tracking.py: resolve_person_state).
+   - Labels used:
+     - NORMAL
+     - ATTENDED
+     - WARNING
+     - ABANDONED
+     - PANIC
+     - INTRUDER
+     - SUSPICIOUS_ACTIVITY
+
+4. Visualization
+   - Bounding boxes are drawn with color-coded overlays depending on alert state.
+   - The UI shows object ID, class label, and state information.
+
+Main Libraries and Technologies
+-------------------------------
+Core Programming Language:
+- Python
+
+Computer Vision and AI:
+- OpenCV (cv2)
+- Ultralytics
+- YOLOv8
+- PyTorch / Torch
+
+Tracking and inference support:
+- ByteTrack via Ultralytics tracker configuration
+
+Other supporting libraries:
+- NumPy (used indirectly by the ML stack)
+- CSV and standard Python libraries for logging and metrics
+
+Model Used
+----------
+- YOLOv8n
+- Model file: yolov8n.pt
+- This was the default detection model used for the prototype.
+- It was loaded through the Ultralytics YOLO interface.
+- Secondary model: yolov8n-pose.pt, loaded lazily and only invoked on frames
+  where the gated limb-motion check triggers (see Suspicious Activities above).
+  Its detections are matched back to the primary model's tracked person IDs by
+  nearest centroid, since it runs independently and has no tracker/IDs of its own.
+
+Setup Instructions
+------------------
+1. Install Python 3.10+ (the project was tested in a Python 3.12 environment).
+2. Install required dependencies:
+   - ultralytics
+   - opencv-python
+   - torch
+3. Place the YOLO model file yolov8n.pt in the project root.
+4. Ensure that sample videos or benchmark footage are available under the data folders.
+5. Run the environment check script if needed:
+   - python check.py
+6. Run benchmark scripts:
+   - python benchmark/baseline_eval.py --video-source <video_path> --max-frames <n>
+   - python benchmark/custom_eval.py --video-source <video_path> --max-frames <n>
+7. Generate the summary report:
+   - python metrics_report/summarize_metrics.py
+8. Record a queryable alert history for a run, then inspect it via MCP:
+   - python main.py --source <video_path> --no-show --event-log surveillance_events.db
+   - python mcp_server/server.py --db-path surveillance_events.db
+     (or point an MCP client, e.g. Claude Desktop's config, at this script + --db-path arg)
+
+Tools Used
+----------
+- Visual Studio Code
+- Python interpreter
+- Git and GitHub
+- Terminal / PowerShell
+- Jupyter-style project notebook workflow (present in the repo structure)
+- CSV-based evaluation output
+
+Datasets and Example Media Considered
+------------------------------------
+The repository includes references to multiple surveillance and anomaly datasets under data/raw, including:
+- VIRAT
+- CDNet
+- ABODA / abandoned-object datasets
+- AVSS 2007
+- Avenue Dataset
+- UFC_Crime-related activity samples
+
+These were used as potential benchmark sources for evaluation and future experiments.
+
+What Results We Got
+-------------------
+The project was verified using a sample VIRAT video.
+
+Verified benchmark output from the repository:
+- Baseline evaluation completed successfully.
+- Custom evaluation completed successfully.
+- CSV telemetry logs were generated in:
+  - benchmark/baseline_logs.csv
+  - benchmark/custom_logs.csv
+
+Measured performance from the verification run:
+- Baseline average inference latency: 14.8540 seconds
+- Baseline speed: 1.7 FPS
+- Custom average inference latency: 1.6023 seconds
+- Custom speed: 5.3 FPS
+- Total tracked IDs in the sample run: 24
+- Fragmentation errors: 19 switches for both pipelines in the sample output
+
+Important note:
+- The benchmark run was performed on a sample video and on the available hardware setup.
+- The observed frame rate was far below the ideal real-time target of 30 FPS, so the current system should be viewed as a functional prototype rather than a production-grade real-time system.
+
+What the Results Mean
+---------------------
+- The project successfully demonstrated end-to-end processing from video input to detection, tracking, state reasoning, and logging.
+- The custom architecture was faster than the baseline run in the tested scenario.
+- The current implementation is strong as a research or prototype pipeline, but it still needs optimization for real-time surveillance use.
+
+Current Status
+--------------
+- The pipeline structure is implemented and connected at the module level.
+- Benchmarking and evaluation support are in place.
+- Metrics summarization is implemented and tested.
+- Dynamic boundaries (ROI scaling), memory eviction (OOM prevention), setup diagnostics, and CLI launcher (`main.py`) are fully implemented and verified.
+
+Strengths of the Project
+------------------------
+- Modular design with clear separation between detection, tracking, and state reasoning.
+- Fully configurable through external configuration files (`config.json`).
+- Dynamic ROI coordinate scaling supporting arbitrary video frame sizes.
+- Memory eviction policy (TTL approach) under thread-safe locks to prevent OOM errors during 24/7 runs.
+- Detailed environment checks and automated test coverage.
+- Benchmarking support and latency metrics summary reports built-in.
+
+Architecture Change: State-Machine Redesign & Gated Pose-Based Behavior Signal (2026-07-20)
+--------------------------------------------------------------------------------------------
+A code review found that the previous "behavioral smoothing" EMA path (src/tracking.py,
+process_behavioral_smoothing) was fed the YOLO person-detection confidence score, not any
+actual behavior/anomaly signal -- it only reflected how clearly a person was detected, and
+silently competed with the kinematic-displacement check for the same SUSPICIOUS_ACTIVITY
+state field. Separately, PANIC had no recovery path back to NORMAL, and INTRUDER / PANIC /
+SUSPICIOUS_ACTIVITY had no defined priority when multiple conditions applied to the same
+tracked person simultaneously. Both have been fixed:
+
+1. State machine redesign (src/tracking.py):
+   - Each detector now writes to its own independent flag (intruder_flag, panic_flag,
+     kinematic_suspicious_flag, limb_suspicious_flag) instead of one shared "state" field.
+   - panic_flag now recovers via a cooldown counter (panic_recovery_frames, default 30
+     frames) instead of latching forever.
+   - kinematic_suspicious_flag is recomputed every frame from the current smoothed
+     displacement average, so it recovers on its own once motion settles.
+   - The single displayed "state" label is resolved once per frame via resolve_person_state()
+     using a fixed priority order: INTRUDER > PANIC > SUSPICIOUS_ACTIVITY > NORMAL, so an
+     unauthorized-access alert can no longer be silently dropped by a simultaneous panic or
+     suspicious-activity flag.
+   - Covered by tests/test_state_resolution.py.
+
+2. Gated pose-based limb-motion signal (src/tracking.py + src/detection.py):
+   - process_behavioral_smoothing now expects a real behavior score, not detection
+     confidence. That score comes from a second model, yolov8n-pose.pt, loaded lazily.
+   - To avoid paying pose-inference cost on every person every frame, it is gated: a
+     person's stationary_counter only accumulates while their kinematic_suspicious_flag
+     is False, and the pose model is only invoked once a tracked person has been
+     near-stationary for state_machine.limb_motion.stationary_frames_gate consecutive
+     frames (default 12) -- exactly the case centroid-only kinematics cannot resolve
+     (fighting/vandalism/shoplifting while standing in place).
+   - Signal: rolling variance of wrist/elbow keypoints relative to a torso reference point
+     (mean of shoulder/hip keypoints), height-normalized, over the behavioral_smoothing
+     window. Each keypoint is confidence-gated (limb_motion.keypoint_min_confidence,
+     default 0.5) before being used, to avoid reintroducing the same jitter-driven
+     false-positive problem centroid-based panic detection already had to fix (bug #6).
+   - The pose model has no tracker of its own; its per-frame detections are matched back
+     to the primary model's tracked person IDs by nearest centroid (detection.py:
+     _process_limb_motion_gate).
+   - New config.json block: state_machine.limb_motion (stationary_frames_gate,
+     keypoint_min_confidence, min_keypoints_required, variance_scale).
+   - Covered by tests/test_limb_motion.py (pure scoring logic) and
+     tests/test_pose_gate_integration.py (gating + nearest-centroid matching glue).
+
+Not yet validated: this has only been exercised via unit tests with synthetic keypoints.
+It has not yet been run against a real video with yolov8n-pose.pt to check the variance_scale
+default (0.02) and activation_threshold produce sensible results on real footage -- those
+will very likely need empirical recalibration before being cited in the paper.
+
+MCP Server: Queryable Alert/Event History (2026-07-21)
+--------------------------------------------------------
+The live pipeline previously kept all tracking state in memory only -- nothing survived
+after a run ended, so there was no way to ask "what happened during this run" after the
+fact. Added a persisted event log and a standalone MCP (Model Context Protocol) server
+that queries it, so an LLM agent can ask natural questions about a recorded run's alert
+history.
+
+- src/event_log.py: a SQLite-backed store with two tables (runs, events). Whenever
+  main.py is started with --event-log <path>, MultiModelDetectionEngine records every
+  frame where a tracked person's or bag's state actually changes (both new alerts --
+  INTRUDER, WARNING, ABANDONED, PANIC, SUSPICIOUS_ACTIVITY -- and recoveries back to
+  NORMAL/ATTENDED), scoped to that run.
+- mcp_server/server.py: a standalone MCP server (the official `mcp` Python SDK) exposing
+  four read-only tools: list_runs, list_alerts (filterable by run/state/time range),
+  get_track_history (full timeline for one specific tracked entity), and get_run_summary
+  (alert counts and unique-entity counts for a run). It only ever reads the SQLite file --
+  it shares no process or thread with the live OpenCV video loop, by design, to avoid the
+  complexity (and risk) of interleaving an async MCP server with a blocking video loop.
+- Verified with a real run, not just synthetic data: ran main.py with --event-log against
+  a real clip, then queried the resulting database through the actual MCP tool-call
+  mechanism (not just schema/registration checks) and confirmed correct results, including
+  correctly excluding NORMAL-state entries from list_alerts.
+- Covered by tests/test_event_log.py (read/write API), tests/test_event_log_integration.py
+  (engine wiring: new alerts logged, unchanged states not re-logged, recoveries logged but
+  excluded from list_alerts, bag vs person entity typing, run summary aggregation).
+- Deliberately out of scope for now: querying state *while* a video is actively being
+  processed (would require running the MCP server's async event loop alongside the
+  blocking OpenCV loop in the same process -- a real architecture change, not attempted
+  here). Also out of scope: the RAG/vector-search and agentic-orchestration pieces
+  originally discussed alongside this (semantic search over alerts, a LangGraph-based
+  summary agent) -- deferred to a future project by design, not built here.
+
+Limitations / Future Improvements
+--------------------------------
+- Real-world deployment can be further optimized for higher frame rates on edge hardware.
+- Integrate GPU-accelerated tensor formatting to maximize inference frame rate.
+- Deepen occlusion handling by integrating a visual Re-ID features layer.
+
+Summary in One Line
+-------------------
+This project is an AI-based CCTV surveillance system that uses YOLOv8, ByteTrack, external JSON configurations, thread-safe memory eviction, and state-machine reasoning to detect anomalies in video streams.
+

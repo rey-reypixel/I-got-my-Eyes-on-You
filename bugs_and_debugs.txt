@@ -1,0 +1,379 @@
+SURVEILLANCE PIPELINE BUGS AND DEBUGS LOG
+=========================================
+
+1. BUG: Bounding Box "Guard Loop" Leak (Frame & Track Count Mismatch)
+-------------------------------------------------------------------
+- Root Cause: In `src/tracking.py` (both `update_tracking_states` and `process_tracking_state_machine`), when ByteTrack had not assigned a tracking ID yet (e.g. during warm-start or low confidence detections), `result.boxes.id` was `None`. The custom pipeline fell back to using the raw loop enumeration index (0, 1, 2...) as a fake tracking ID. This injected ghost tracklets for background noise, inflating frame counts (e.g. starting at frame 22 instead of 83) and unique track counts (e.g. 4 IDs instead of 2).
+- Fix: Added strict guard checks `if track_ids is None: continue` in `update_tracking_states` and `process_tracking_state_machine` inside `src/tracking.py`, and in `_route_tracking_updates` in `src/detection.py`. This aligns with the baseline's strict guard condition `getattr(results[0].boxes, "id", None) is not None`, dropping frames/detections before they are tracked, and completely removed the index fallback.
+
+2. BUG: Object Class Type Leaking (Inanimate Objects Flagged as Intruders)
+-------------------------------------------------------------------------
+- Root Cause: In `process_tracking_state_machine` and visual overlays, the pipeline retrieved threat states from the person tracking buffer `tracked_people` for all detected objects indiscriminately. As a result, when fake/reused track IDs matched, background furniture or context items like ovens, suitcases, and bottles were labeled as `INTRUDER`s and triggered critical alerts.
+- Fix: Isolated state queries by object class category. Added checks so that:
+  - Only detections classified as `"person"` (or matching COCO class index 0) query the `tracked_people` buffer.
+  - Only detections classified as `"backpack"`, `"handbag"`, or `"suitcase"` (or matching COCO bag indices) query the `tracked_bags` buffer.
+  - All other object categories default to the `"NORMAL"` state and do not trigger threat alerts or overlay statuses.
+
+3. BUG: COCO Class Label Inversion (The Objective 3 Trap)
+--------------------------------------------------------
+- Root Cause: In the bag proximity search loop inside `src/tracking.py`, the code attempted to locate a nearby human owner using the check `if detection["label"] != 0:`. Since class index 0 is explicitly assigned to a `"person"` in the COCO schema, this logic treated all non-person objects (ovens, bottles) as humans, and ignored actual humans.
+- Fix: Corrected the condition to locate the owner using `if is_person:` where `is_person` is determined by `detection["class_label"] == "person"` or `detection["label"] == COCO_PERSON_INDEX` (0). This ensures bags calculate distance only to actual humans.
+
+4. BUG: Unicode Encode Crash on Windows Terminals
+-------------------------------------------------
+- Root Cause: The metrics reporting script `metrics_report/summarize_metrics.py` threw a `UnicodeEncodeError` when run on Windows command shells because of non-ASCII print formatting characters (emojis like 📊 and ⚠️, and bullets like •).
+- Fix: Replaced all terminal print emojis and bullets with ASCII-safe formatting strings (e.g. `[WARNING]`, `-`).
+
+5. BUG: Memory Accumulation / Leak (Out of Memory OOM in Long-Running Streams)
+-----------------------------------------------------------------------------
+- Root Cause: In-memory state tracking containers (`tracked_people`, `tracked_bags`, `behavioral_smoothing_buffer`) in `src/state_machine.py` accumulated historical parameters and path history indefinitely. In long-running/continuous CCTV scenarios, this causes unbounded memory growth and process terminations due to OOM errors.
+- Fix: Introduced a `"state_max_stale_frames"` threshold configuration (default 300) in `config.json` and a corresponding `stale_counter` parameter inside state tracking structures. Implemented thread-safe garbage collection loops in `src/tracking.py` (wrapped under lock handlers `tracked_people_lock`, `tracked_bags_lock`, and `behavioral_smoothing_buffer_lock`) to prune track IDs that vanish from the active scene for longer than the configured frame threshold.
+
+6. BUG: Perspective-Driven False Panic Alerts (Low-Velocity Centroid Jitter)
+----------------------------------------------------------------------------
+- Root Cause: Small coordinate jitter (1-2 pixels) when standing still created minor displacements. When a person is standing still, their mean historical velocity is extremely close to zero, so a tiny jitter was mathematically flagged as a massive relative acceleration/velocity spike (exceeding `mean_v * threshold_devs`), triggering a false `"PANIC"` state.
+- Fix: Implemented a velocity smoothing low-pass filter in `verify_panic_anomaly` inside `src/detection.py` that averages current velocity over the last 3 frames to smooth out single-frame tracking noise. Additionally, set a strict panic velocity floor of `0.18` (18% of body height per frame) to completely separate walking and tracking noise from actual panic running.
+
+7. BUG: Dynamic Bag Proximity Match Failure (Close-Up Perspective Mismatch)
+----------------------------------------------------------------------------
+- Root Cause: When a person is close to the camera, their bounding box is very large. A hand-held bag/suitcase or a bag sitting at their feet is physically far from their centroid waist level. The previous static horizontal threshold of `40.0` pixels was too narrow for close-up subjects, triggering false `"UNATTENDED"` warning states.
+- Fix: Modified `src/tracking.py` to dynamically scale the attendance disconnect and reconnect distance thresholds as a function of the closest person's bounding box height:
+  - `d_disconnect = max(bag_disconnect_dist, person_height * 0.75)`
+  - `d_reconnect = max(bag_reconnect_dist, person_height * 0.5)`
+  This dynamically stretches the allowed owner-bag distance as the person expands in scale near the camera.
+
+8. BUG: Bounding Box Clipping & Scale-Jump Velocity Spikes
+----------------------------------------------------------
+- Root Cause: When a person walked super close or near the boundaries, their body got cut off by the screen edges. The detector only detected their head, resulting in a sudden drop in bounding box height `height`. Since normalized velocity is computed as `displacement / height`, the artificially small `height` caused the calculated velocity to explode. Additionally, when the box changed from full-body to head-only, the foot/centroid coordinate jumped vertically, creating a massive false velocity spike.
+- Fix: Added multiple layers of stabilization:
+  - **Centroid-Based Kinematics**: Changed kinematic tracking to use the box center `(x_center, y_center)` instead of the foot position `(foot_x, foot_y)` for velocity calculations, eliminating false jumps from legs disappearing.
+  - **Scale Memory & Perspective Adaptation**: Retained maximum observed height `max_observed_height` and estimated height based on vertical position (`y_center * 0.45`), using their max as the normalization height `norm_h` to prevent division-by-small-height.
+  - **Scale-Jump Suppression**: Detects sudden frame-to-frame height changes of >25% and suppresses velocity calculations for that frame.
+  - **Boundary Clipping Check**: Clears motion history if the box is within 2 pixels of any screen border.
+
+9. BUG: Inverted Spatial ROI Polygon (Intruder Walkway / Normal Tracks)
+-----------------------------------------------------------------------
+- Root Cause: The calibrated `roi_polygon` boundaries in `config.json` covered the middle-right area of the frame (the safe platform walkway), while leaving the left side of the platform (the actual train tracks danger zone) as a safe zone. This caused normal walkway pedestrians to trigger `INTRUDER` alerts, and trackbed trespassers to remain `NORMAL`.
+- Fix: Recalibrated `roi_polygon` in `config.json` to cover the actual train tracks region to the left of the safety line: `[[0.0, 0.0], [0.22, 0.0], [0.12, 1.0], [0.0, 1.0]]`.
+
+10. BUG: Loose Bag Proximity & Delayed Unattended warning (Owner/Bystander Proximity Mismatch)
+-----------------------------------------------------------------------------------------------
+- Root Cause: Calculating proximity using only body centroids led to high offset values for bags on the floor (causing warnings to be delayed), while using only feet coordinates led to large offsets for carried shoulder backpacks (causing carried bags to falsely trigger warnings). Additionally, overly loose thresholds (e.g. `0.75 * height`) allowed owners to walk too far before warning and bystander matching was too generous.
+- Fix: Modified the proximity logic in `src/tracking.py` to:
+  - Take the minimum distance between the bag and the person's *feet* `(foot_x, foot_y)` (for floor bags) and their *centroid* `(x_center, y_center)` (for carried bags).
+  - Tighten the dynamic threshold multipliers to `0.45 * height` for disconnect and `0.30 * height` for reconnect.
+  This reliably detects carried/placed states while maintaining high responsiveness.
+
+11. BUG: Inappropriate Default ROI Polygon Application
+-------------------------------------------------------
+- Root Cause: The `roi_polygon` was hardcoded in `config.json` for AVSS Westminster platform train tracks, but was applied globally to all videos processed by the engine. For indoor corridor videos (like ABODA video1.avi), this caused normal walkway occupants on the left side of the screen to be falsely flagged as `INTRUDER`s.
+- Fix: Configured `MultiModelDetectionEngine` in `src/detection.py` to load `roi_polygon` only if `"AVSS"` is present in the video source string. All other videos default to an empty ROI list, disabling intruder alerts.
+
+12. FEATURE: Video Seeking (Rewind and Skip 10 Seconds)
+------------------------------------------------------
+- Enhancement: Added keyboard hotkey support in the OpenCV display window during both active playback and paused states:
+  - **Rewind 10 seconds**: Pressing `r`, `[`, or Left Arrow (key code 81) seeks backwards.
+  - **Skip/Forward 10 seconds**: Pressing `f`, `]`, or Right Arrow (key code 83) seeks forwards.
+- Implementation: Performs frame seek adjustments using `cv2.CAP_PROP_POS_FRAMES` scaled by the source video's FPS (`cv2.CAP_PROP_FPS`), and updates the tracking engine's frame step count correspondingly. Seeking while paused updates the current frame display and automatically re-enters the paused state.
+
+13. BUG: YOLO Detection Dropouts for Stationary Placed Bags
+----------------------------------------------------------
+- Root Cause: Once an owner leaves a bag stationary on the floor, YOLO's confidence can drop, causing detection to drop out. Previously, because state tracking only ran on actively detected bag candidates, missing bags ceased to compute distance updates to the owner and remained stuck in the `"ATTENDED"` state. Since they were `"ATTENDED"`, they were never drawn by the visual persistence overlay.
+- Fix:
+  - Modified `src/tracking.py` to evaluate proximity states for both actively detected bags and missing bags that are already tracked (using their last known coordinates). This allows a missing bag to correctly transition to `"WARNING"` and `"ABANDONED"` as the owner walks away.
+  - Configured `src/detection.py` to draw persisted bounding boxes and alert text for all `"WARNING"` and `"ABANDONED"` bags that are not in the current frame's detections for up to 150 frames.
+
+14. BUG: No State Tracking Updates During Zero-Pedestrian Frames
+--------------------------------------------------------------
+- Root Cause: When the owner and all other pedestrians walked out of the camera view, the frame became empty of people. Because the state machine had a guard checking `closest_person is not None` before calling `process_abandoned_logic`, empty-frame scenarios bypassed distance and state updates entirely, keeping the bag permanently locked in the `"ATTENDED"` state and preventing the warning/abandoned alert overlays from showing.
+- Fix: Removed the `closest_person` guard from the bag update loop in `src/tracking.py` and updated `process_abandoned_logic` in `src/detection.py` to handle `person_coords=None` by assigning a distance of infinity. This allows the state machine to run and correctly transition the bag to `"WARNING"` and `"ABANDONED"` states when there are no people present.
+15. BUG: Fallback Default Polygon Application causing False Intruder Alerts
+--------------------------------------------------------------------------
+- Root Cause: When the AVSS safety tracks polygon was filtered out for non-AVSS video streams (like the ABODA corridor video), `raw_polygon` was set to `None`. This triggered the fallback `else` block which loaded the default mockup 4-point ROI polygon. Because this default polygon covers most of the frame, all pedestrians walking down the center of the corridor were falsely flagged as `INTRUDER`.
+- Fix: Modified the AVSS polygon check in `src/detection.py` to assign `self.roi_polygon = []` and return immediately if the hardcoded AVSS tracks polygon is loaded for a non-AVSS video source. This completely disables ROI polygon processing for these streams while preserving the mock fallback for tests and missing configurations.
+16. BUG: Overlapping / Ghost Annotations and Missing Boxes for Placed Bags
+-------------------------------------------------------------------------
+- Root Cause:
+  1. Tracking fragmentation assigned multiple track IDs to the bag as it was carried (e.g. `Bag 11`, `Bag 15`). When these dropped out, their coordinates froze at the hydrant. As the person walked away, the distance to these coordinates increased, causing the ghost tracks to transition to `"WARNING"` and `"ABANDONED"` and draw overlapping boxes.
+  2. Attempting to filter this by checking if the bag had a long stationary history (e.g. >= 5 frames) created a regression where new floor bag detections (e.g. `Bag 53`) with short history lengths (< 5 frames) were permanently locked in `"ATTENDED"` and vanished from the screen when they dropped out.
+- Fix:
+  - **Carried Bag Following**: Configured the state machine to classify a bag as carried (`"is_carried": True`) if its distance to the closest person's centroid is small (`< 0.35 * height`). If a carried bag drops out, its coordinates are updated dynamically to follow the closest person's centroid, preventing it from freezing and triggering ghost warnings. Placed bags on the floor do not follow the centroid and correctly transition to warning/abandoned as the owner walks away.
+  - **Duplicate Suppression**: If two tracked bags are within 80 pixels of each other, the older track ID is evicted from memory, eliminating duplicate overlapping boxes.
+17. BUG: Multiple Fragmented Bag Detections for the Same Owner (Duplicate Alerts)
+--------------------------------------------------------------------------------
+- Root Cause: When a carried bag (e.g. `Bag 10`) drops out and transitions to a new track ID (e.g. `Bag 9`) on the floor, both tracks belong to the same physical bag. Although the duplicate check clears items within 80 pixels of each other, the distance between the hydrant (where `Bag 10` froze) and the floor (where `Bag 9` sits) is around 200 pixels. Consequently, both tracks remained in memory, causing the engine to visualize two separate abandoned boxes.
+- Fix: Modified [tracking.py](file:///f:/Summer%20Internship/I-got-my-Eyes-on-You/src/tracking.py) to resolve the closest person's track ID (`owner_id`) for every bag. When a new active bag track is detected, the engine scans the database for any other missing/dropout bags associated with the same owner and immediately evicts them from memory.
+18. BUG: KeyError During Loop Execution on Dynamically Evicted Bag Track IDs
+-------------------------------------------------------------------------
+- Root Cause: In [tracking.py](file:///f:/Summer%20Internship/I-got-my-Eyes-on-You/src/tracking.py), the bag loop iterates over `all_bag_ids_to_process` (which is a pre-calculated union of active and tracked bag IDs). During the loop, if a carried bag drops out and its floor duplicate is processed, owner-based duplicate suppression immediately evicts (pops) the old carried bag ID from the `tracked_bags` dictionary. When the loop subsequently reaches that evicted bag ID, it attempts to access `tracked_bags[bag_id]`, throwing a `KeyError` and crashing the surveillance pipeline.
+- Fix: Added a safety check at the very beginning of the loop in `src/tracking.py`: if the bag ID is not actively detected (`bag_id not in active_bag_ids`) and is no longer present in `tracked_bags`, the loop skips it (`continue`), preventing `KeyError` exceptions.
+19. BUG: Invisible Bounding Box on Floor Bags during Initial Dropouts
+----------------------------------------------------------------------
+- Root Cause: When a bag was placed on the floor, it was tracked as `"ATTENDED"`. If the bag suffered a YOLO detection dropout immediately (before the owner walked away past the `d_disconnect` threshold and before the temporal warning timer fired), the box disappeared completely from the screen. This was because the persistence logic in `src/detection.py` only rendered missing/dropout bags if they were already in the `"WARNING"` or `"ABANDONED"` states, causing the bag box to look like it disappeared.
+- Fix: Modified `src/detection.py` to persist rendering for ALL states (including `"ATTENDED"`) of tracked bags during YOLO dropouts. The green `"ATTENDED (PERSISTED)"` box remains continuously visible on the floor, transforming smoothly into `"WARNING (PERSISTED)"` and `"ABANDONED (PERSISTED)"` as the owner moves away.
+
+20. BUG: Ghost Bounding Boxes on People and Missing Boxes for Placed Bags
+--------------------------------------------------------------------------
+- Root Cause:
+  1. The heuristic `d_centroid < person_height * 0.35` misclassified placed bags as carried if the person stood near the bag or bent over (making their centroid close to the bag).
+  2. Because the placed bag was falsely flagged as `is_carried = True`, when it inevitably dropped out from YOLO detection, the tracking engine assumed a carried bag was dropping out. It updated the missing bag's coordinates to exactly follow the person's centroid.
+  3. This resulted in two visual glitches: a ghost bag bounding box sticking to the person's chest (since the bag coordinates followed the centroid), and NO bounding box remaining around the actual bag on the floor (since its coordinates were moved).
+  4. Additionally, the aggressive `owner_id` eviction logic deleted valid placed bag tracks if the person's track was updated.
+- Fix:
+  - Replaced the absolute pixel heuristic with a robust vertical distance heuristic: `is_carried = dy_centroid <= dy_feet`. A placed bag (on the floor) is always vertically closer to the person's feet than to their centroid, even when bending down.
+  - Removed the coordinate-following logic for missing bags. Instead, if a carried bag drops out, it is immediately evicted from `tracked_bags` to prevent ghost tracks and false alarms altogether.
+  - Removed the aggressive `owner_id` duplicate removal, relying solely on the existing spatial distance duplicate suppression (`dist < 80`).
+
+21. BUG: Behavioral Smoothing Fed Detection Confidence Instead of a Behavior Signal
+------------------------------------------------------------------------------------
+- Root Cause: `process_behavioral_smoothing` in `src/tracking.py` was called with the YOLO
+  person-detection confidence score (`confs[index]`), not any actual behavior/anomaly
+  signal. This meant the EMA path meant to catch fighting/vandalism/shoplifting-style
+  anomalies instead fired `SUSPICIOUS_ACTIVITY` whenever a person was clearly, confidently
+  detected for enough consecutive frames -- unrelated to what they were doing. It also
+  independently competed with the kinematic-displacement check for the same state field,
+  which was the likely cause of state flickering observed during testing.
+- Fix: Removed the confidence-based call sites entirely. `process_behavioral_smoothing` now
+  only gets invoked with a real signal -- the pose-based limb-motion variance score computed
+  by `compute_limb_motion_score` (see item 24) -- and sets its own independent
+  `limb_suspicious_flag` instead of writing directly to `state`.
+
+22. BUG: PANIC State Had No Recovery Path
+-------------------------------------------
+- Root Cause: Once a tracked person's state flipped to `PANIC`, nothing in
+  `update_tracking_states` ever transitioned them back to `NORMAL` -- the ROI check only
+  recovered `INTRUDER`, the displacement check only upgraded from `{NORMAL, INTRUDER}`, and
+  the (then confidence-driven) EMA check only touched `{NORMAL, SUSPICIOUS_ACTIVITY}`. A
+  single panic spike red-flagged a track for the rest of its tracked lifetime.
+- Fix: Added `panic_flag` + `panic_cooldown` to each tracked person. A panic trigger latches
+  the flag and resets the cooldown to `panic_recovery_frames` (config, default 30 frames);
+  each subsequent frame without a new trigger decrements the cooldown, and the flag clears
+  once it reaches zero.
+
+23. BUG: No Priority Between INTRUDER / PANIC / SUSPICIOUS_ACTIVITY
+------------------------------------------------------------------------
+- Root Cause: `INTRUDER`, `PANIC`, and `SUSPICIOUS_ACTIVITY` were all written directly to the
+  same `state` field by independent, order-dependent code blocks with no defined precedence.
+  An intruder who also tripped a kinematic panic spike silently lost their `INTRUDER` label
+  and became `PANIC` instead -- the unauthorized-access alert vanished.
+- Fix: Each detector now sets its own independent flag (`intruder_flag`, `panic_flag`,
+  `kinematic_suspicious_flag`, `limb_suspicious_flag`). The single displayed `state` label is
+  resolved once per frame by `resolve_person_state()` using a fixed priority order:
+  `INTRUDER > PANIC > SUSPICIOUS_ACTIVITY > NORMAL`.
+
+24. FEATURE: Gated Pose-Based Limb-Motion Detector (Stationary Behavioral Anomalies)
+-----------------------------------------------------------------------------------------
+- Motivation: Centroid-based kinematics cannot see a person who is standing still but moving
+  their limbs violently (fighting, vandalism, shoplifting) -- zero centroid displacement, zero
+  signal. A second model is required to see into that blind spot, but running full pose
+  inference on every person every frame would roughly double inference cost.
+- Implementation: Each tracked person accumulates a `stationary_counter` while their
+  `kinematic_suspicious_flag` stays False. Once that counter reaches
+  `state_machine.limb_motion.stationary_frames_gate` (default 12 frames), the person becomes
+  eligible for the pose check. `src/detection.py` only invokes the pose model
+  (`yolov8n-pose.pt`, lazily loaded) on frames where at least one tracked person is gated in,
+  matches the pose model's per-frame detections back to tracked person IDs by nearest
+  centroid (it has no tracker/IDs of its own), and feeds `compute_limb_motion_score` (rolling,
+  height-normalized, confidence-gated variance of wrist/elbow keypoints relative to a torso
+  reference point) through the existing EMA smoothing to set `limb_suspicious_flag`.
+- Status: unit-tested with synthetic keypoints (tests/test_limb_motion.py,
+  tests/test_pose_gate_integration.py); not yet validated against real video, so the default
+  `variance_scale` (0.02) and `activation_threshold` will likely need empirical recalibration.
+
+25. BUG: Non-Square Video Frames Distorted by Naive Stretch-Resize
+--------------------------------------------------------------------
+- Root Cause: `_resize_frame` in `src/detection.py` called `cv2.resize(frame, (imgsz, imgsz))`
+  unconditionally, forcing every frame to a square regardless of the source video's native
+  aspect ratio. Discovered while validating the pose-based limb-motion check against a real
+  UCF-Crime clip (320x240, 4:3) and noticing people weren't detected at all at several points
+  in the video. A 320x240 frame squished to 640x640 is stretched 2.0x horizontally but 2.667x
+  vertically -- an anisotropic distortion of human proportions that a detector trained on
+  normally-proportioned people is not expected to handle well. This affected every non-square
+  video the pipeline has ever processed (most of the project's datasets), not just this clip.
+- Fix: Replaced the naive stretch with a letterbox resize: scale preserving aspect ratio via
+  `min(imgsz / src_w, imgsz / src_h)`, then center the result on an `imgsz x imgsz` canvas
+  padded with neutral gray (114, matching the standard YOLO letterbox pad value). Output shape
+  is unchanged (still `imgsz x imgsz`), so ROI polygon scaling and clipping thresholds
+  elsewhere in the pipeline that assume that coordinate space did not need to change.
+- Follow-up: `benchmark/baseline_eval.py` and `benchmark/custom_eval.py` had their own,
+  separate, duplicated naive-resize calls -- neither used `MultiModelDetectionEngine`, so
+  neither benefited from this fix at all. The letterbox logic was extracted into a standalone
+  `letterbox_resize(frame, imgsz)` function (`src/detection.py`) that `_resize_frame` now
+  delegates to, and both benchmark scripts were updated to import and use it directly, so a
+  baseline-vs-custom comparison isolates the engineering layer rather than incidentally also
+  comparing preprocessing quality. `benchmark/baseline_logs.csv`/`custom_logs.csv` have since
+  been regenerated under this fix (see item #30).
+  Any ROI polygon calibrated against a specific non-square video's old (distorted) coordinate
+  space may also need re-checking, though no such video currently exists under data/raw at
+  time of writing.
+
+26. BUG: A Person's Box Vanished Outright on a Single-Frame Detection Dropout
+------------------------------------------------------------------------------
+- Root Cause: Bags already had a "persist the last-known box during a brief YOLO detection
+  dropout" mechanism (items #13/#19), but this was only ever implemented for bags, never
+  extended to people. Discovered while validating real video: a person standing still could
+  have her bounding box disappear completely for one or two frames (YOLO's own per-frame
+  confidence dipping -- common on grainy CCTV footage) even though she never moved and her
+  tracking ID (`tracked_people[person_id]`) was untouched underneath.
+- Note: distinguished during debugging from a related but different problem -- if the person's
+  ID itself changes after reappearing (e.g. after turning around and bending down), that is a
+  real ByteTrack identity switch (no Re-ID/appearance matching, only motion+IoU association),
+  not this bug. That is a known, already-documented limitation (see "Limitations / Future
+  Improvements" in PROJECT_DOCUMENTATION.txt: "integrate a visual Re-ID features layer") and
+  was deliberately left unfixed for now rather than patched with a same-ID-recovery heuristic.
+- Fix: Added `last_known_center` / `last_known_width` / `last_known_height` to each tracked
+  person, updated unconditionally on every frame they're actively detected (`src/tracking.py`).
+  `src/detection.py`'s drawing loop now tracks `drawn_person_ids` (mirroring the existing
+  `drawn_bag_ids`) and renders a `(PERSISTED)` box from the last-known values for any tracked
+  person missing from the current frame's detections, for the same 150-frame (5 second)
+  window already used for bags.
+- Covered by tests/test_person_persistence.py (the last-known-box bookkeeping in
+  `update_tracking_states`; the actual pixel drawing in `detection.py` requires cv2 and is
+  exercised via manual runs only, same as the pre-existing bag-drawing code).
+- Correction: cv2/numpy/ultralytics turned out to already be installed in this project's
+  `.venv` -- the claim above ("exercised via manual runs only") and an earlier claim of not
+  being able to run `main.py` at all were both wrong. See item #27, which was verified with a
+  real headless run (`python main.py --no-show`) and a proper mocked-cv2 test, not just visual
+  inspection.
+
+27. BUG: Fragmented Person IDs Each Persisted Their Own Ghost Box (Stacking Duplicates)
+------------------------------------------------------------------------------------------
+- Root Cause: Item #26's fix (persist a person's last-known box during a brief detection
+  dropout) was added without the duplicate-suppression logic bags already have for the exact
+  same class of problem (items #16/#17/#20). Because ByteTrack has no Re-ID/appearance
+  matching (see #26's note), a single physical person can leave behind several different
+  fragmented IDs over the course of a video (e.g. `Person 1` -> `Person 4` -> `Person 6` ->
+  `Person 7`, all from one person turning around / bending down / brief occlusion). Once
+  every tracked ID independently persists its own `(PERSISTED)` ghost box, that one person
+  visibly turned into 3-4 stacked, overlapping boxes on screen, several of which lingered
+  long after she had actually walked out of frame -- confirmed via real video
+  (`data/raw/suspicious_activities/UFC_Crime/Fighting/Fighting002_x264.mp4`).
+- Fix:
+  - Before rendering ghost boxes, candidates are sorted by `stale_counter` ascending (most
+    recently actually seen first). Each candidate is only drawn if its `last_known_center`
+    is more than 80px (matching the bag duplicate-suppression radius) from every box already
+    claimed this frame (live people, and ghosts already drawn) -- so only the freshest
+    fragment of a given physical person renders, not all of them stacked.
+  - The persistence window for people was also decoupled from the bag window and shortened:
+    a stationary bag lingering on screen for the bag's 5-second grace window is a reasonable
+    approximation of reality, but a person is mobile -- a ghost frozen in place for 5 seconds
+    after she's actually left misrepresents the scene rather than just covering a blip. New
+    config key `state_machine.person_persist_frames` (default 30 frames / ~1 second at 30fps).
+- Covered by tests/test_ghost_dedup.py, using a real (mocked) cv2 to confirm only one box is
+  drawn for a cluster of fragmented IDs at the same position, that spatially distinct people
+  each still get their own box, and that a ghost stops rendering once `person_persist_frames`
+  is exceeded.
+
+28. BUG: Pose-Gate Eligibility Never Checked Whether the Person Was Still Actually There
+---------------------------------------------------------------------------------------------
+- Root Cause: `get_pose_gated_person_ids` (`src/tracking.py`) only checked whether a person's
+  `stationary_counter` had ever crossed the gate threshold -- it never checked whether that
+  person was still being actively detected. Since `stationary_counter` freezes at whatever
+  value it had the moment a person stops being redetected (it's only updated inside the
+  active-detection loop), a person who left the frame long ago kept showing up as "eligible
+  for limb check" every single frame until full eviction (up to 300 stale frames / 10 sec).
+  Discovered while investigating a reported identity switch (Person 1 -> Person 6): debug
+  output showed Person 1 as pose-gate "eligible" continuously for 70+ frames after her
+  `stale_counter` had already climbed past 30, i.e. well after she'd actually left.
+- Impact: No incorrect score was ever produced (the nearest-centroid matching step downstream
+  in `_process_limb_motion_gate` correctly finds no live centroid for a stale ID and skips
+  it), but the eligibility bookkeeping -- and the debug output relied on to validate this
+  feature against real video -- was misleading, making a real identity-switch event look
+  momentarily like two people being tracked simultaneously.
+- Fix: `get_pose_gated_person_ids` now also requires `stale_counter == 0` (actively
+  redetected in the current frame), not just a qualifying `stationary_counter`.
+- Covered by tests/test_limb_motion.py::test_stale_person_is_excluded_even_with_a_qualifying_counter.
+
+29. BUG: A Stationary Bag's WARNING/ABANDONED Timer Reset Every Time Its Track ID Churned
+--------------------------------------------------------------------------------------------
+- Root Cause: Discovered by tracing a real clip (`data/raw/abandoned_objects/ABODA-master/video1.avi`)
+  frame-by-frame: one stationary, placed bag was reassigned 7 different track IDs in about 4
+  seconds (`15 -> 17 -> 15 -> 20 -> 24 -> 25 -> 26`), the same class of ID-fragmentation problem
+  already known for people (ByteTrack has no Re-ID/appearance matching), just happening on the
+  bag side too. The pre-existing duplicate-bag-distance eviction (items #16/#20) correctly
+  prevented two of these fragments from ever being drawn on screen simultaneously, but it does
+  nothing to stop the churn itself -- and every time a fragment got evicted and a new one took
+  over, the new bag entry was created fresh as `"state": "ATTENDED", "timer": 0`. Practically,
+  this means a genuinely abandoned bag's warning timer could never accumulate long enough to
+  reach WARNING/ABANDONED if the underlying detection kept losing and reacquiring it every few
+  seconds -- directly undermining the accuracy of the abandoned-object objective.
+- Fix: Added `find_recoverable_bag_id(bx, by, active_bag_ids)` (`src/tracking.py`). When a bag
+  ID is seen for the first time, instead of unconditionally initializing fresh state, it first
+  looks for an existing tracked bag that is *not* currently active (i.e. genuinely vanished,
+  not just a different, still-alive bag) within an 80px radius (matching the existing
+  duplicate-bag distance convention) of the new detection's position, and if found, carries
+  over its `state` and `timer` (and `owner_id` as a fallback) instead of resetting them.
+- Why this is safe for bags but was deliberately *not* done for people (see item #26's note):
+  a bag is stationary. Two different bags coincidentally appearing at almost the exact same
+  pixel position moments apart is essentially impossible, so treating a nearby vanished bag as
+  "the same bag reacquired" is a safe bet. Two different *people* crossing the same spot is a
+  completely ordinary occurrence, which is why the equivalent heuristic was rejected for the
+  person-side identity-switch problem.
+- Covered by tests/test_bag_recovery.py: recovering state/timer from a nearby vanished bag,
+  starting fresh when no vanished bag is nearby, and confirming a still-actively-detected bag
+  is never treated as a recovery source (tested directly against `find_recoverable_bag_id` to
+  avoid confounding with the separate, pre-existing duplicate-eviction mechanism).
+- Follow-up correction: re-verifying against the same real clip after this fix showed *zero*
+  change in behavior -- every "NEW bag" entry still read `ATTENDED, 0`. Instrumenting the
+  actual eviction sites directly (temporary prints, since guessing had already been wrong
+  once) found the real cause: a *separate*, more aggressive, pre-existing path evicts a bag
+  outright the instant it's classified `is_carried=True` and drops out of detection for even
+  one frame (`tracked_bags.pop(bag_id, None)`, no grace period at all). `find_recoverable_bag_id`
+  only helps when a *differently-numbered* stale entry is still sitting in `tracked_bags` --
+  it does nothing when the entry has already been deleted outright, which is what was
+  actually happening here (confirmed via the same instrumentation: 10 carried-dropout
+  evictions and 7 duplicate-distance evictions on this bag in the observed window, both
+  bypassing the fix above entirely).
+  - Extended fix: added a short-lived echo buffer, `state_machine.recently_evicted_bags`
+    (TTL 30 frames), populated whenever a carried bag is evicted on dropout instead of just
+    discarded. `find_recoverable_bag_id` now checks both `tracked_bags` (stale-but-present)
+    and this echo buffer, returning `(id, source)` so the caller knows where to pop from.
+    Covered by `tests/test_bag_recovery.py::CarriedBagEchoTests`.
+  - Re-verified against the same real clip a third time: the echo-recovery path does fire
+    correctly (confirmed via instrumentation), but it happened to make no *visible* difference
+    in this specific window, because every eviction on this particular bag carried
+    `state=ATTENDED, timer=0` -- it never actually progressed past ATTENDED before each churn
+    event, so there was nothing more advanced to lose in the first place. Whether that's this
+    bag genuinely being handled on-and-off by someone nearby, or a misfiring `is_carried`
+    classification, is a separate, unresolved question -- not chased further here. The fix
+    itself is correct and tested; it simply doesn't have a dramatic before/after story on
+    *this* bag because the "losing real WARNING/ABANDONED progress" scenario it targets never
+    arose in the observed window.
+
+30. METHODOLOGY BUG: "Custom" Benchmark Latency Excludes YOLO Inference Entirely
+---------------------------------------------------------------------------------
+- Root Cause: `benchmark/baseline_eval.py` times the *entire* `model.track(...)` call (YOLO
+  inference + ByteTrack). `benchmark/custom_eval.py` only times `process_tracking_state_machine`
+  (the engineering layer) -- its own `model.track(...)` call happens first but is explicitly
+  excluded from the timer (the code comments say so: "Clock ONLY our custom engineered state
+  machine layers"). This makes the two numbers non-comparable as an end-to-end measurement:
+  regenerating both under the current, fixed pipeline still produced baseline=0.1062s/9.4 FPS
+  vs custom=0.0006s/1707.2 FPS -- and reading that as "our system is ~180x faster than
+  baseline" would be false and indefensible under any real scrutiny, since YOLO's ~106ms cost
+  does not disappear in the real pipeline; it's simply not what's being measured on the
+  custom side. (This is the same framing problem already present in the pre-existing
+  resume.txt bullet claiming a "150x speedup" -- discovered while sanity-checking that claim
+  before using these numbers in the paper.)
+- Correct interpretation: the engineering layer adds ~0.0006s on top of the unavoidable
+  ~0.106s detection cost -- i.e. under 1% end-to-end latency overhead for all three objectives
+  (intrusion, abandoned objects, suspicious activity) combined. That is the defensible claim;
+  "custom runs at 1707 FPS" is not.
+- Not fixed (a documentation/interpretation issue, not a code defect to patch): flagged here so
+  future benchmark runs and paper claims interpret these two CSVs correctly rather than
+  comparing them directly.
+
+31. METHODOLOGY GAP: "Identity Switches" Metric Assumes a Hardcoded Ground Truth of 5 Objects
+-------------------------------------------------------------------------------------------------
+- Root Cause: `metrics_report/summarize_metrics.py` computes `fragmentation_errors` (displayed
+  as "Identity Switches") as `max(0, unique_ids - 5)` -- `5` is a hardcoded assumed
+  ground-truth object count, not derived from the actual video. Sanity-checked against a real
+  clip (VIRAT `VIRAT_S_010000_00_000000_000165.mp4`) by extracting and visually inspecting
+  frames: at least 6-7 distinct people are visible in a single frame alone, meaning the
+  hardcoded assumption of 5 does not hold for this clip, and the resulting "identity switches"
+  number is not meaningful as computed.
+- Not fixed: VIRAT ships real frame-by-frame ground-truth object annotations
+  (`data/raw/unauthorised_access/VIRAT/annotations-and-docs/annotations/*.viratdata.objects.txt`)
+  that could replace this hardcoded guess with a real, defensible ground-truth count and
+  proper precision/recall/identity-switch metrics. Not yet built -- flagged as the concrete
+  next step if a real accuracy number is needed for the paper, rather than continuing to
+  report a number based on an unverified assumption.
