@@ -15,6 +15,8 @@ if str(ROOT) not in sys.path:
 
 from ultralytics import YOLO
 
+from src.detection import letterbox_resize
+
 
 def discover_video_source(explicit_source: Optional[str] = None) -> Path:
     """Locate a benchmark video from CLI input or the repository's raw data directories."""
@@ -61,9 +63,9 @@ def run_baseline_evaluation(video_source: Optional[str] = None, max_frames: int 
             if max_frames and frame_id > max_frames:
                 break
 
-            frame_resized = cv2.resize(frame, (640, 640))
+            frame_resized = letterbox_resize(frame, 640)
             t_start = time.perf_counter()
-            results = model.track(frame_resized, persist=True, tracker="bytetrack.yaml")
+            results = model.track(frame_resized, persist=True, tracker="bytetrack.yaml", classes=[0, 24, 26, 28])
             t_end = time.perf_counter()
 
             latency = t_end - t_start
