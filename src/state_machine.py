@@ -38,6 +38,19 @@ behavioral_smoothing_buffer: Dict[int, List[float]] = {
     # person_id: []
 }
 
+# 4. Short-lived echo of bags evicted while classified as "carried" (see
+# bugs_and_debugs.txt #29's follow-up). A carried bag is deleted outright the
+# instant it drops out of detection (to avoid its ghost lingering/following
+# the wrong person), which otherwise loses all accumulated state/timer if the
+# same physical bag is reacquired moments later under a new (or reused)
+# track ID. This buffer keeps just enough of a trace, for a short frame
+# window, for that reacquisition to recover the accumulated state.
+recently_evicted_bags_lock = threading.Lock()
+recently_evicted_bags: Dict[int, Dict[str, Any]] = {
+    # Example Schema:
+    # bag_id: {"center_coords": (0, 0), "state": "ATTENDED", "timer": 0, "owner_id": None, "ttl": 30}
+}
+
 
 def reset_state() -> None:
     """Clear all in-memory tracking structures safely."""
@@ -47,6 +60,8 @@ def reset_state() -> None:
         tracked_bags.clear()
     with behavioral_smoothing_buffer_lock:
         behavioral_smoothing_buffer.clear()
+    with recently_evicted_bags_lock:
+        recently_evicted_bags.clear()
 
 
 def register_person(person_id: int, state: str = "NORMAL") -> None:
@@ -84,9 +99,11 @@ __all__ = [
     "tracked_people",
     "tracked_bags",
     "behavioral_smoothing_buffer",
+    "recently_evicted_bags",
     "tracked_people_lock",
     "tracked_bags_lock",
     "behavioral_smoothing_buffer_lock",
+    "recently_evicted_bags_lock",
     "reset_state",
     "register_person",
     "register_bag",
