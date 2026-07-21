@@ -109,7 +109,37 @@ def generate_summary(
 
 
 if __name__ == "__main__":
-    try:
-        print(generate_summary())
-    except FileNotFoundError as exc:
-        print(f"Telemetry logs missing. Please run benchmark/baseline_eval.py and benchmark/custom_eval.py first.\n{exc}")
+    from pathlib import Path
+
+    # Define paths relative to the project root directory
+    root = Path(__file__).resolve().parent.parent
+    baseline_path = root / "benchmark" / "baseline_logs.csv"
+    custom_path = root / "benchmark" / "custom_logs.csv"
+
+    print("\n" + "=" * 50)
+    print(" SURVEILLANCE PIPELINE PERFORMANCE SUMMARY")
+    print("=" * 50)
+
+    # Process Baseline Metrics if log exists
+    if baseline_path.exists():
+        b_metrics = compute_metrics(baseline_path)
+        print(f"\n[BASELINE TRACKING LOGS]")
+        print(f"  - Average Latency     : {b_metrics['avg_latency']:.4f} seconds")
+        print(f"  - Average Framerate   : {b_metrics['avg_fps']:.1f} FPS")
+        print(f"  - Unique Tracked IDs  : {b_metrics['unique_ids']}")
+        print(f"  - Identity Switches  : {b_metrics['fragmentation_errors']}")
+    else:
+        print(f"\n[WARNING] Baseline logs not found at: {baseline_path}")
+        
+    # Process Custom Enhanced Metrics if log exists
+    if custom_path.exists():
+        c_metrics = compute_metrics(custom_path)
+        print(f"\n[CUSTOM ENHANCED STATE MACHINE LOGS]")
+        print(f"  - Average Latency     : {c_metrics['avg_latency']:.4f} seconds")
+        print(f"  - Average Framerate   : {c_metrics['avg_fps']:.1f} FPS")
+        print(f"  - Unique Tracked IDs  : {c_metrics['unique_ids']}")
+        print(f"  - Identity Switches  : {c_metrics['fragmentation_errors']}")
+    else:
+        print(f"\n[WARNING] Custom enhanced logs not found at: {custom_path}")
+        
+    print("=" * 50 + "\n")

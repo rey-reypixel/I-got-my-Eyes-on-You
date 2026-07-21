@@ -1,0 +1,34 @@
+{
+  "roi_polygon": [
+    [0.0, 0.0],
+    [0.22, 0.0],
+    [0.12, 1.0],
+    [0.0, 1.0]
+  ],
+  "detection": {
+    "confidence": 0.35,
+    "imgsz": 640,
+    "device": "cpu"
+  },
+  "state_machine": {
+    "th_frames": 10,
+    "panic_threshold_devs": 3.0,
+    "bag_disconnect_dist": 50.0,
+    "bag_reconnect_dist": 30.0,
+    "state_max_stale_frames": 300,
+    "kinematic_velocity_threshold": 0.15,
+    "min_velocity_history_frames": 5,
+    "panic_recovery_frames": 30,
+    "person_persist_frames": 30,
+    "behavioral_smoothing": {
+      "window_size": 10,
+      "activation_threshold": 0.5,
+      "beta": 0.85
+    },
+    "limb_motion": {
+      "stationary_frames_gate": 12,
+      "keypoint_min_confidence": 0.5,
+      "min_keypoints_required": 2
+    }
+  }
+}
