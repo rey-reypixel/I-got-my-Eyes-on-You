@@ -3,23 +3,23 @@ Phase 3 Progress Report
 
 Completed Tasks
 ---------------
-- Implemented benchmark evaluation entry points for baseline and custom tracking pipelines.
+- Implemented benchmark evaluation entry points for baseline and custom tracking pipelines. Two pipelines now race each other. Only one of them trains for it.
 - Added a compatibility tracking export layer so benchmark scripts can emit structured telemetry rows.
-- Verified the new tracking export through a regression test.
+- Verified the new tracking export through a regression test, because "it probably works" is not a testing strategy, it's a hope.
 - Ran both evaluation scripts successfully on a sample VIRAT video.
-- Audited the custom tracking pipeline and resolved three critical telemetry/logic defects:
+- Audited the custom tracking pipeline and resolved three critical telemetry/logic defects, because apparently three things were broken and none of them had the courtesy to be obvious:
   - Fixed the bounding box guard loop leak to align Custom log frame counts with Baseline logs.
-  - Fixed object class type state leakage by ensuring only persons/bags query their respective state machines.
+  - Fixed object class type state leakage by ensuring only persons/bags query their respective state machines. (Ovens do not get to be intruders. Ovens have never once tried to sneak anywhere.)
   - Fixed COCO class label inversion in the abandoned bag owner search.
 - Regenerated the resulting CSV outputs:
   - benchmark/baseline_logs.csv
   - benchmark/custom_logs.csv
 - Added a dedicated metrics summarization utility in metrics_report/summarize_metrics.py to aggregate latency, FPS, and tracking-fragmentation metrics from the log files.
-- Restructured `summarize_metrics.py` to be ASCII-safe to prevent UnicodeEncodeError crashes on Windows command line interfaces.
+- Restructured `summarize_metrics.py` to be ASCII-safe to prevent UnicodeEncodeError crashes on Windows command line interfaces. Emojis: banned. This terminal has had enough excitement.
 - Verified the summarization workflow with a regression test in tests/test_summarize_metrics.py.
 - Implemented environment diagnostic check in check.py to test package imports, directory structure, and PyTorch CUDA hardware acceleration.
 - Built a dynamic configuration layer loading settings, scaled ROI polygon coordinates, and timing parameters from config.json.
-- Integrated an automated Stale State Eviction Policy (OOM Prevention) in src/tracking.py to evict track IDs missing for longer than the max stale threshold.
+- Integrated an automated Stale State Eviction Policy (OOM Prevention) in src/tracking.py to evict track IDs missing for longer than the max stale threshold, so the memory doesn't just quietly fill up and ruin everyone's weekend.
 - Created a unified CLI entry point main.py to easily configure and run the engine on any video/webcam feed.
 - Added comprehensive unit tests in tests/test_config.py verifying dynamic boundary scaling and memory eviction behavior.
 
@@ -27,15 +27,14 @@ Technical Notes
 ---------------
 - Baseline evaluation uses YOLO tracking with ByteTrack and writes frame-level object telemetry.
 - Custom evaluation routes detections through the state-machine-based orchestration layer and logs additional state metrics.
-- Telemetry outputs (baseline and custom logs) are now fully aligned in terms of frame range, unique tracked IDs, and target tracking sets.
+- Telemetry outputs (baseline and custom logs) are now fully aligned in terms of frame range, unique tracked IDs, and target tracking sets. They finally agree on something.
 - The summarization utility reads the benchmark CSV logs and produces a paper-ready performance summary table.
-- The scripts are resilient to missing placeholder paths by discovering a valid video file under the repository data folders.
-- In-memory state tracking utilizes locks for thread safety, and stale counters prune vanished entities after state_max_stale_frames to prevent memory accumulation leaks.
+- The scripts are resilient to missing placeholder paths by discovering a valid video file under the repository data folders, instead of just shrugging and crashing.
+- In-memory state tracking utilizes locks for thread safety, and stale counters prune vanished entities after state_max_stale_frames to prevent memory accumulation leaks. Nobody lingers forever. Not even in this codebase.
 
 Current Status
 --------------
-- Phase 3 benchmark framework is fully corrected, aligned, and operational.
+- Phase 3 benchmark framework is fully corrected, aligned, and operational. Could it BE any more aligned?
 - The metrics reporting workflow is now in place and verified.
 - Telemetry logs demonstrate correct state assignments and perfect alignment between Baseline and Custom pipelines.
-- Dynamic boundaries, environment diagnostics, interactive CLI, and memory eviction are fully implemented and verified passing all test suites.
-
+- Dynamic boundaries, environment diagnostics, interactive CLI, and memory eviction are fully implemented and verified passing all test suites. That's four for four. We'll allow ourselves a moment.

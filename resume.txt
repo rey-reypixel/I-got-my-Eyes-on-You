@@ -1,0 +1,62 @@
+================================================================================
+GOOGLE STANDARD (X-Y-Z FORMULA) RESUME BULLET POINTS
+================================================================================
+Formula: "Accomplished [X], as measured by [Y], by doing [Z]"
+All numbers below are from real, ground-truth-verified evaluation runs performed
+in this session (benchmark/evaluate_against_ground_truth.py against VIRAT
+annotations; benchmark/*.csv; tests/*). The previous version of this file
+contained unverified/misleadingly-framed numbers and should not be used.
+--------------------------------------------------------------------------------
+
+[BULLET 1: GROUND-TRUTH-VALIDATED DETECTION ACCURACY]
+* Validated a real-time person-detection and tracking pipeline against ground-truth
+  annotations rather than relying on unverified estimates, achieving 75.8% precision
+  and 54.9% recall (IoU >= 0.5) at realistic CCTV camera distance, by building a
+  custom evaluation harness that performs coordinate-space-correct IoU matching
+  against VIRAT's frame-level bounding-box annotations.
+
+[BULLET 2: LOW-OVERHEAD MULTI-OBJECTIVE THREAT REASONING]
+* Delivered three parallel threat-detection capabilities (unauthorized-access
+  intrusion, abandoned-object monitoring, and kinematic/pose-based suspicious-
+  activity detection) for under 1% additional end-to-end latency (0.6 ms reasoning
+  layer vs. 106.2 ms detection latency), by decoupling the state-machine
+  reasoning layer from the YOLOv8/ByteTrack inference path.
+
+[BULLET 3: SYSTEMATIC DEFECT DISCOVERY THROUGH REAL-WORLD VALIDATION]
+* Identified and resolved 37 defects -- including a state-machine priority bug
+  that silently dropped intrusion alerts, an image-preprocessing distortion bug
+  affecting every non-square video processed, and identity-fragmentation-driven
+  duplicate rendering -- by systematically testing the pipeline against six
+  real-world surveillance datasets (VIRAT, ABODA, UCF-Crime, Avenue, CDNet, AVSS)
+  instead of relying on synthetic test cases alone, shipping each fix with a
+  dedicated regression test across a 66-test automated suite.
+
+[BULLET 4: IMAGE-PREPROCESSING CORRECTNESS FIX]
+* Eliminated a systemic detection-accuracy bug affecting every non-square video
+  in the pipeline (up to 33% anisotropic distortion of human proportions from a
+  naive stretch-resize), by implementing aspect-ratio-preserving letterbox
+  preprocessing shared across the live inference engine and both benchmark
+  evaluation scripts.
+
+[BULLET 5: IDENTITY-FRAGMENTATION-RESILIENT STATE RECOVERY]
+* Prevented an abandoned-object monitoring system from silently losing in-progress
+  alert timers when the underlying tracker reassigned an object's ID mid-track
+  (a known limitation of IoU-based multi-object trackers), by designing a
+  proximity-scoped state-recovery mechanism, including a short-lived recovery
+  buffer for objects evicted while temporarily misclassified.
+
+[BULLET 6: QUERYABLE INCIDENT-HISTORY SYSTEM (MCP SERVER)]
+* Built a queryable, agent-accessible incident-history layer for a real-time
+  surveillance system by implementing a standalone MCP server (official Python
+  `mcp` SDK) backed by a SQLite event log, exposing 4 read-only tools
+  (list_runs, list_alerts, get_track_history, get_run_summary) and verifying
+  the full pipeline end-to-end against a real recorded run.
+
+[BULLET 7: ROOT-CAUSE FIX RESOLVING BOTH A FALSE-NEGATIVE AND A FALSE-POSITIVE ALERTING FAILURE]
+* Resolved two opposite-facing alerting defects -- a genuinely-abandoned object
+  losing its alert entirely across a real, measured 649-frame (~21.6s) detection
+  gap, and a genuinely-retrieved object falsely persisting as abandoned -- with a
+  single motion-stability signal, by directly instrumenting the live pipeline
+  frame-by-frame against real video rather than relying on synthetic tests alone,
+  a process that caught two prior interim fixes as insufficient before shipping
+  the verified, correct one.

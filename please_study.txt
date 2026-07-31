@@ -1,0 +1,867 @@
+I-GOT-MY-EYES-ON-YOU: COMPLETE STUDY NOTES
+===========================================
+Purpose of this file: everything you need to be able to defend this project
+cold -- in a viva, a job interview, or a paper Q&A -- without having to
+re-derive it under pressure. Organized as: what we built and why, the math
+underneath every piece, the tools/libraries and why each was chosen, the
+real problems we hit and how we found/fixed them, the honest advantages and
+disadvantages, future work, and a dedicated "things professors love to
+grill you on" section with model answers.
+
+Written 2026-07-22. If you read this weeks later and something looks off
+against the actual code, trust the code -- this is a snapshot, not a live
+document.
+
+
+====================================================================
+1. WHAT THE PROJECT IS AND WHY IT EXISTS
+====================================================================
+
+One-sentence version: a real-time CCTV analysis pipeline that takes raw
+YOLOv8 + ByteTrack detections (which only know "what is where, this frame")
+and adds a reasoning layer on top that knows "what does this mean over
+time" -- specifically for three security objectives: unauthorized access,
+abandoned objects, and suspicious activity.
+
+WHY this gap exists and matters:
+- A detector like YOLO answers "is there a backpack in this frame, at this
+  box." It has zero memory. It cannot tell you the backpack has been sitting
+  there for 5 minutes with nobody nearby -- that requires state across
+  frames, which the detector fundamentally does not have.
+- A tracker like ByteTrack adds "this backpack in frame N is probably the
+  same physical backpack as the one in frame N-1" (an identity across time),
+  but it still has no concept of "attended," "abandoned," "restricted zone,"
+  or "suspicious." Those are domain-specific reasoning concepts that have to
+  be built on top.
+- This is the exact gap real commercial "AI-powered CCTV" products have to
+  solve, and it's usually solved with exactly this kind of engineering layer
+  (state machines, proximity heuristics, temporal thresholds) rather than by
+  training one enormous end-to-end model. That's a deliberate, defensible
+  architectural choice, not a shortcut -- see Section 9.
+
+
+====================================================================
+2. SYSTEM ARCHITECTURE (THE PIPELINE, END TO END)
+====================================================================
+
+    Video frame (file / webcam / RTSP)
+      -> letterbox resize (aspect-ratio-preserving, padded to imgsz x imgsz)
+      -> YOLOv8n inference + ByteTrack association (model.track(persist=True))
+         -> gives: per-object {track_id, class, box, confidence} this frame
+      -> update_tracking_states() (src/tracking.py)
+         -> updates in-memory state for every tracked person and bag
+         -> resolves each person's displayed state via 3 independent flags
+         -> resolves each bag's ATTENDED/WARNING/ABANDONED state
+      -> (conditionally) pose-model pass for stationary people (Objective 3's
+         limb-motion signal) -- only runs when gated in, see Section 3.3
+      -> visual overlay (color-coded boxes + text labels drawn onto the frame)
+      -> (optional) SQLite event log write, if a state actually changed
+      -> loop to next frame
+
+Two parallel state containers live in src/state_machine.py, both
+thread-safe (each guarded by its own threading.Lock):
+  - tracked_people: dict[person_id -> dict of everything we know about them]
+  - tracked_bags:   dict[bag_id -> dict of everything we know about it]
+Plus two supporting buffers: behavioral_smoothing_buffer (rolling confidence
+history, now mostly superseded) and recently_evicted_bags (a short-lived
+"echo" of a bag's state right after it's deleted, so a bag reacquired under
+a new ID moments later doesn't lose its accumulated WARNING/ABANDONED
+progress -- see Section 6.3).
+
+Why in-memory dicts and not a database for live state? Because this state
+needs to be read and written every single frame, tens of times a second --
+a database round-trip per frame would dominate the latency budget for no
+benefit. The database (SQLite, src/event_log.py) exists for a *different*
+purpose: persisting the *history* of state changes so it survives after the
+process ends and can be queried later. Live state = memory. Historical
+record = database. Different problems, different tools.
+
+
+====================================================================
+3. THE THREE OBJECTIVES: WHAT, WHY, AND THE MATH
+====================================================================
+
+--------------------------------------------------------------------
+3.1 OBJECTIVE 1 -- UNAUTHORIZED ACCESS (restricted-zone intrusion)
+--------------------------------------------------------------------
+WHAT: a polygon (list of (x, y) vertices) defines a restricted zone in the
+frame. Every tracked person's *foot* coordinate (not their box center --
+feet are where someone actually "is," standing on the ground) is tested
+every frame: is it inside the polygon? If yes, intruder_flag = True.
+
+WHY the foot coordinate, not the box center or the top of the box: a
+person's bounding box top can be well outside a ground-level zone boundary
+even while they're standing inside it (their head is taller than the zone
+line), and the box center is roughly waist-height, which drifts with how
+much of their body the box happens to capture (partial occlusion, being cut
+off by frame edge). The foot point -- x_center, y_center + height/2 -- is
+the actual ground-contact point, which is what "standing inside a zone"
+really means physically.
+
+THE MATH -- ray casting (point-in-polygon):
+This is the classic even-odd rule algorithm. To test whether point P is
+inside a polygon: draw an imaginary horizontal ray from P off to (say)
+positive x-infinity, and count how many polygon edges that ray crosses. If
+the count is odd, P is inside; if even, P is outside. Intuition: every time
+the ray crosses a boundary it flips from outside to inside or vice versa,
+so an odd number of crossings means you end up on the opposite side from
+where you started (infinity, which is always outside).
+
+Implementation walks each polygon edge (A, B) and checks:
+  1. Does the edge's y-range straddle P's y-coordinate? (Only edges that
+     cross the ray's height can possibly intersect it.)
+  2. If yes, compute the x-coordinate where the edge crosses that height:
+        x_intersect = A.x + (P.y - A.y) * (B.x - A.x) / (B.y - A.y)
+     (This is just linear interpolation along the edge -- similar triangles.)
+  3. If P.x <= x_intersect, the ray (going rightward from P) crosses this
+     edge; increment the crossing count.
+Final test: intersect_count % 2 != 0 -> inside.
+
+Complexity: O(number of polygon vertices) per person per frame -- trivial
+cost, this is why intrusion detection is essentially free computationally.
+
+WHY no "stickiness"/hysteresis here (unlike Objective 2, which explicitly
+has hysteresis): entering/exiting a zone should be reflected the instant it
+happens -- there's no ambiguous boundary case worth smoothing over the way
+there is for "has this bag really been abandoned" (which benefits from not
+flickering right at a threshold). intruder_flag is recomputed fresh every
+frame with zero memory of the previous frame.
+
+Config: roi_polygon in config.json, in normalized (0.0-1.0) or absolute
+pixel coordinates -- normalized values get scaled by imgsz at load time, so
+the same polygon definition works across differently-sized input videos.
+
+--------------------------------------------------------------------
+3.2 OBJECTIVE 2 -- ABANDONED OBJECTS
+--------------------------------------------------------------------
+WHAT: every tracked bag (backpack/handbag/suitcase, COCO classes 24/26/28)
+is modeled as a 3-state machine:
+    ATTENDED  --(owner too far)-->  WARNING  --(timer >= threshold)-->  ABANDONED
+       ^________________________________|_______________________________|
+                    (someone comes close enough again)
+
+WHY a state machine and not a single boolean "is abandoned": because the
+real-world behavior needs a *time* dimension. A bag isn't abandoned the
+instant its owner steps two feet away to look at a map -- it's abandoned if
+nobody attends to it for a *sustained* period. A 3-state machine with a
+timer is the natural way to encode "this has been true continuously for N
+frames" without hand-rolling ad-hoc counters everywhere.
+
+THE MATH -- proximity (Euclidean distance):
+    d = sqrt((person_x - bag_x)^2 + (person_y - bag_y)^2)
+Compared against two *different* thresholds depending on direction:
+  - d_disconnect (bigger): how far the owner must move away to leave
+    ATTENDED and start the WARNING timer.
+  - d_reconnect (smaller): how close someone must come back to cancel
+    WARNING/ABANDONED and return to ATTENDED.
+
+WHY two different thresholds (this is called HYSTERESIS): if disconnect and
+reconnect used the *same* threshold, a person standing almost exactly at
+that distance would cause the state to flicker back and forth every frame
+from tiny pixel jitter (their tracked position naturally wobbles a couple
+pixels frame to frame even standing still). Hysteresis creates a "dead
+zone" between the two thresholds where nothing changes, which absorbs that
+jitter. This is the same principle as a thermostat: it doesn't turn the
+heater on at exactly 20.0C and off at exactly 20.0C -- it turns on below
+19C and off above 21C, so it doesn't cycle on/off every second near 20C.
+
+THE MATH -- perspective-scaled thresholds:
+    d_disconnect = max(bag_disconnect_dist, person_height * 0.45)
+    d_reconnect  = max(bag_reconnect_dist,  person_height * 0.30)
+WHY: in a camera frame, "50 pixels" means something completely different
+depending on how far someone is from the camera. A person close to the
+camera has a large bounding box (their pixel height is large) -- 50 pixels
+of separation from their bag might be nothing (bag still basically at their
+feet). A person far from the camera has a tiny bounding box -- 50 pixels of
+separation might represent several real-world meters. Scaling the threshold
+by the person's own detected height converts a fixed pixel distance into
+something that approximately tracks real-world distance regardless of depth
+in the frame. This is a cheap, heuristic stand-in for true 3D perspective
+correction (which would need camera calibration/homography, not attempted
+here).
+
+THE MATH -- carried vs. placed classification:
+    dy_centroid = |person_centroid_y - bag_y|
+    dy_feet     = |(person_centroid_y + person_height/2) - bag_y|
+    is_carried  = (dy_centroid <= dy_feet)  [only if person is close enough,
+                                              see Section 6 for why the gate
+                                              matters]
+WHY this works: a bag riding on someone's shoulder/back is vertically near
+their *torso* (centroid), not their *feet*. A bag sitting on the floor next
+to them is vertically near their *feet*, not their torso (the person's
+centroid is roughly waist-height, well above ground). Comparing which
+reference point the bag is closer to, vertically, is a cheap way to
+distinguish "worn" from "resting on the ground" without any extra model or
+pose information.
+
+THE MATH -- motion-stability check (added this session, see Section 6):
+    net_displacement = sqrt((bx_now - bx_N_frames_ago)^2 +
+                             (by_now - by_N_frames_ago)^2)
+    if is_carried and net_displacement <= threshold_px:
+        is_carried = False  # override: it hasn't actually gone anywhere
+WHY: a bag genuinely being carried displaces frame to frame because it's
+moving with a walking person. A bag that's resting on the floor does not
+displace, no matter what the vertical heuristic above says that frame. This
+is a second, independent signal (motion over time, not just vertical
+position in a single frame) that catches cases where the first heuristic
+gets fooled by incidental camera-perspective alignment.
+
+Config knobs (config.json -> state_machine): th_frames (WARNING ->
+ABANDONED timer threshold), bag_disconnect_dist, bag_reconnect_dist,
+bag_carried_dropout_grace_frames, bag_stationary_window, bag_stationary_px,
+bag_persist_frames, state_max_stale_frames.
+
+--------------------------------------------------------------------
+3.3 OBJECTIVE 3 -- SUSPICIOUS ACTIVITY
+--------------------------------------------------------------------
+WHAT: two independent signals, combined into one flag.
+
+  (a) Kinematic signal (centroid velocity):
+      Detects "moving unusually fast" (e.g. running, sudden lunges).
+
+  THE MATH -- normalized velocity:
+      pixel_displacement = sqrt((x_t - x_prev)^2 + (y_t - y_prev)^2)
+      normalized_velocity = pixel_displacement / person_height
+  WHY normalize by height: exactly the same perspective problem as Section
+  3.2 -- "10 pixels per frame" is a sprint for someone far from the camera
+  (tiny box) and barely a shuffle for someone close to the camera (huge
+  box). Dividing displacement by the person's own detected height converts
+  raw pixel speed into a body-height-relative speed, which is roughly
+  perspective-invariant.
+
+  THE MATH -- panic/anomaly detection (statistical outlier over a rolling
+  window):
+      v_current = mean(last 3 velocity samples)          # smooths jitter
+      v_historical_mean = mean(velocity samples before that)
+      panic = (v_current >= 0.18) and (v_current > v_historical_mean * threshold_devs)
+  WHY: this is a simple form of anomaly detection -- flag a value that's a
+  large multiple of the recent baseline, i.e. "moving much faster than this
+  person's own recent normal," rather than an absolute speed cutoff (which
+  would either miss slow-moving anomalies or false-positive on people who
+  are just naturally quick). The 0.18 floor exists because someone standing
+  still has a baseline velocity near zero, so *any* small multiple of near-
+  zero is still near-zero in absolute terms -- without an absolute floor,
+  tiny tracking jitter (1-2px) while standing still could look like a huge
+  *relative* spike (bug #6 in the defect log; this floor is the fix).
+
+  (b) Pose-based limb-motion signal (the "stationary fight" blind spot):
+  WHY it exists: centroid-based kinematics is blind to a person who is
+  standing still overall (zero centroid displacement) but whose *limbs* are
+  moving violently -- fighting, vandalizing, shoplifting. A stationary
+  brawl and a person patiently waiting for a bus look mathematically
+  identical to signal (a) alone.
+  WHY it's *gated* (only sometimes runs): running a full pose-estimation
+  model on every detected person, every frame, would roughly double
+  inference cost for a signal that's only useful in a narrow situation
+  (someone already stationary). Instead: a person accumulates a
+  stationary_counter while NOT kinematically suspicious; once that counter
+  crosses a threshold (12 frames default), *only then* does the pose model
+  get invoked for that person, that frame. This is a compute-vs-coverage
+  trade-off made explicit and measured (see Section 8, the <1% latency
+  overhead figure includes this signal's real runtime cost).
+  THE MATH -- limb-motion variance score:
+      torso_reference = mean(shoulder_L, shoulder_R, hip_L, hip_R keypoints)
+      for each of {elbow_L, elbow_R, wrist_L, wrist_R}:
+          offset = (keypoint - torso_reference) / person_height   # normalized
+      per_frame_magnitude = mean(|offset| for each limb keypoint this frame)
+      variance = Var(per_frame_magnitude over a rolling window)
+      score = min(1.0, variance / variance_scale)
+  WHY variance and not raw distance: raw limb-to-torso distance is large
+  for someone just standing with arms slightly out, and small for someone
+  standing at attention -- neither is "suspicious" on its own. VARIANCE
+  captures *change over time* -- limbs moving around a lot (fighting,
+  flailing) produces high variance in that magnitude signal; limbs held in
+  one position (even an unusual one) produces low variance. This is the
+  same "look at the change, not the absolute value" idea as the kinematic
+  signal's anomaly detection.
+  Each keypoint is confidence-gated (only used if the pose model's own
+  per-keypoint confidence exceeds a threshold) to avoid feeding noisy,
+  low-confidence keypoint jitter into the variance calculation, which would
+  reproduce the same false-positive jitter problem the panic-floor fix
+  (above) already had to solve once.
+
+  THE MATH -- EMA smoothing (used for both the limb-motion score above and
+  historically for other rolling signals):
+      current_ema = beta * previous_ema + (1 - beta) * current_raw_value
+  WHY EMA (Exponential Moving Average) instead of a simple average: EMA
+  weights recent samples more heavily than old ones (geometrically
+  decaying weight), so it responds faster to a real, sustained change while
+  still smoothing out single-frame noise -- a good middle ground between
+  "average over a long window" (smooth but slow to react) and "use only
+  the latest sample" (reacts instantly but noisy).
+
+STATE RESOLUTION (how one person ends up with exactly one displayed label):
+Each detector above writes to its OWN independent boolean flag
+(intruder_flag, panic_flag, kinematic_suspicious_flag, limb_suspicious_flag)
+instead of all writing to one shared "state" field. The single displayed
+label is resolved once per frame by a FIXED PRIORITY ORDER:
+    INTRUDER > PANIC > SUSPICIOUS_ACTIVITY > NORMAL
+WHY: if all four detectors wrote directly to the same field, whichever ran
+*last* in the code would silently overwrite whatever an earlier detector
+had just set -- e.g. an active intrusion alert could vanish just because a
+kinematic panic spike happened to fire the same frame (this was a real bug,
+see Section 7). Separating detection (independent flags) from *display*
+(one resolved priority) means no detector can accidentally erase another's
+finding; you only ever lose *visibility* of a lower-priority condition,
+never the underlying fact that it's still true.
+
+
+====================================================================
+4. SUPPORTING ENGINEERING (NOT A "THREAT OBJECTIVE" BUT LOAD-BEARING)
+====================================================================
+
+4.1 Letterbox preprocessing
+WHAT/WHY: every frame is resized to a square imgsz x imgsz (e.g. 640x640)
+before inference, because the detector was trained on square inputs. THE
+MATH:
+    scale = min(imgsz / src_w, imgsz / src_h)     # preserve aspect ratio
+    new_w, new_h = src_w * scale, src_h * scale
+    pad_x = (imgsz - new_w) / 2 ; pad_y = (imgsz - new_h) / 2
+    canvas = solid gray (114,114,114) image of imgsz x imgsz
+    canvas[pad_y : pad_y+new_h, pad_x : pad_x+new_w] = resized_frame
+This scales the frame down/up so the LONGER side exactly fits imgsz, then
+centers the result on a padded canvas, rather than independently stretching
+width and height to fill the square (which distorts proportions -- a
+320x240 frame naively stretched to 640x640 is stretched 2.0x horizontally
+but 2.667x vertically, visibly squashing every person in the frame). "min()"
+is the key choice: it guarantees the scaled image fits *inside* the target
+square on both axes (using max() instead would overflow one axis).
+
+4.2 Thread-safe memory eviction (preventing unbounded growth / OOM)
+Every tracked person/bag accumulates a stale_counter: incremented each
+frame it's NOT actively redetected, reset to 0 each frame it IS. Once that
+counter exceeds a threshold (state_max_stale_frames), the entry is deleted
+from the tracking dict entirely. WHY: without this, a 24/7 camera feed
+would accumulate one dictionary entry per track ID *forever* -- every
+person and bag that ever walked through frame, never removed -- which is
+unbounded memory growth over a long-running process. All the dict mutations
+are wrapped in explicit threading.Lock() context managers because, while
+this specific pipeline currently runs single-threaded, the state containers
+are written defensively as if something else (e.g. a future async MCP
+integration, Section 5) might read/write them concurrently.
+
+4.3 Track-ID-churn-resilient bag state recovery
+WHY this is needed at all: ByteTrack has NO appearance-based re-
+identification -- it associates detections purely by motion + bounding-box
+overlap (IoU). A bag briefly occluded, or whose detection confidence dips
+for a frame, can be reassigned a *brand new* track ID when it reappears,
+even though it's physically the same bag. Without any mitigation, that new
+ID would start its abandonment timer over from zero -- a bag that's
+*actually* been sitting unattended for 4 minutes could look, to the state
+machine, like it just appeared 2 seconds ago, indefinitely delaying a real
+ABANDONED alert.
+THE FIX (two layers):
+  (a) find_recoverable_bag_id(): when a brand-new bag track ID appears,
+      search existing tracked (but not currently active) bags within an
+      80px radius. If one is found, transfer its accumulated state/timer to
+      the new ID instead of starting fresh. Safe specifically because bags
+      are STATIONARY -- two different physical bags coincidentally
+      appearing at nearly the same pixel position moments apart is
+      essentially impossible, so "nearby vanished bag" is a safe proxy for
+      "same physical bag, new ID." (Deliberately NOT done for people: two
+      different people crossing the same spot is an everyday occurrence,
+      so the same heuristic would be unsafe there.)
+  (b) recently_evicted_bags echo buffer: a short-lived (30-frame TTL) cache
+      of a bag's state at the moment it's evicted, so even a bag that gets
+      deleted outright (see Section 6) still leaves something for (a) to
+      recover from if it reappears moments later.
+
+4.4 Ghost-box deduplication (for people)
+WHY: because of the same ID-churn problem above, one physical person can
+accumulate several different track IDs over a video (turning around,
+brief occlusion). If every one of those IDs independently renders its own
+"last known position" ghost box during a brief dropout, a single person can
+visibly appear as 3-4 stacked, overlapping boxes. Fix: before rendering a
+ghost box, check whether its position is within 80px of any box already
+claimed this frame (live or already-drawn-ghost); only the most-recently-
+actually-seen candidate at a given position gets drawn.
+
+
+====================================================================
+5. THE PERSISTED EVENT LOG + MCP SERVER
+====================================================================
+See also: Section 12 below, dedicated to explaining MCP itself.
+
+WHAT: everything above lives only in memory -- once the process ends, all
+history is gone. src/event_log.py adds an OPTIONAL SQLite-backed log: every
+frame where a tracked person's or bag's state actually *changes* (not every
+frame -- only transitions) gets one row written to an `events` table, scoped
+to a `runs` table (one row per program execution). mcp_server/server.py is
+a small standalone process that exposes four READ-ONLY query tools over
+that same SQLite file via the Model Context Protocol.
+
+WHY separate from the live video loop entirely (different process, no
+shared state): the live pipeline is a tight, blocking, frame-by-frame loop
+-- injecting an async MCP server's event loop into the same process would
+mean either blocking video processing while a query is answered, or a real
+concurrency redesign to interleave them safely. Keeping them as two
+completely separate processes that only share a SQLite *file* sidesteps
+that entire class of problem: the MCP server can be started, stopped, or
+crash independently of the live pipeline, and vice versa, because the only
+thing connecting them is a file on disk.
+
+
+====================================================================
+6. PROBLEMS WE FACED (major themes, not a line-by-line repeat of the log)
+====================================================================
+The full blow-by-blow is in bugs_and_debugs.txt (37 numbered entries by the
+end of this session). Group them into themes -- this is what actually
+matters for explaining "what problems did you face":
+
+THEME A -- Class/type confusion (early, foundational bugs, #1-3)
+Ovens and bottles briefly got treated as tracked people/intruders because
+of an inverted condition (`label != 0` instead of `label == 0`) and because
+state was queried from the wrong dictionary for the wrong object class.
+Lesson: the fix wasn't "be more careful" -- it was adding an explicit
+is_person/is_bag classification gate everywhere state gets queried, so the
+class of bug becomes structurally impossible rather than just less likely.
+
+THEME B -- Perspective/scale blindness (bugs #7, #8, #10, letterbox #25)
+Multiple bugs traced back to treating raw pixel distances/sizes as if they
+meant the same thing regardless of camera depth: bag-ownership thresholds
+too tight for close-up subjects, velocity spikes from bounding-box-height
+collapsing at frame edges, and a full-frame preprocessing distortion. The
+running fix pattern: normalize by something that scales with apparent size
+(person height) rather than using fixed pixel constants.
+
+THEME C -- No re-identification (Re-ID) in the tracker (bugs #16-20, #26,
+#27, #29, and this session's #32-36)
+By far the deepest, most recurring category. ByteTrack's IoU+motion-only
+association means track IDs are NOT stable identities -- they churn on
+occlusion, pose change, or even brief detection-confidence dips. This
+single root cause produced: duplicate ghost boxes (person AND bag side),
+abandoned-object timers resetting on ID churn, a carried bag's box
+disappearing outright on drop, and (this session) both a false negative
+(a genuinely-abandoned bag losing its box for 21+ seconds) and a false
+positive (a genuinely-carried-away bag falsely lingering as "ABANDONED").
+Every one of these got a *different* mitigation because "the same physical
+object might get a new ID" manifests differently depending on context --
+there is no single fix, only a family of heuristics (proximity-based
+recovery, echo buffers, motion-stability checks, grace windows) that each
+patch one specific failure mode of the same underlying gap. The actual fix
+for the root cause -- appearance-based Re-ID -- was deliberately not
+implemented; see Section 8 (Future Work).
+
+THEME D -- Benchmark/measurement honesty (bugs #30, #31, and this session's
+paper-numbers-going-stale issue)
+Two "methodology bugs," not code bugs: an internal benchmark comparing
+full detection+tracking latency against a number that excluded detection
+latency entirely (produced a false "150-180x speedup" claim), and an
+"identity switches" metric computed against a hardcoded, unverified assumed
+ground-truth object count. Neither was a code defect -- the code did
+exactly what it was asked to. The problem was asking the wrong question of
+the data. This theme is arguably the most important one to be able to talk
+about in an interview: it shows the difference between "the code ran" and
+"the number means what I'm claiming it means."
+
+THEME E -- This session's investigation methodology (worth describing
+explicitly if asked "how do you debug"): every fix in this session started
+from a REPRODUCTION -- either a targeted synthetic unit-test scenario or an
+actual instrumented run against real footage (ABODA video1.avi, AVSS
+AVSSS07_EASY.mpg) -- before writing any fix, and every fix was re-verified
+against the same real footage afterward, not just re-run through the unit
+test suite. Two fixes (raising two of three related thresholds) were caught
+as *insufficient* specifically because of that real-footage re-verification
+step -- a synthetic-test-only workflow would likely have shipped both as
+"done" prematurely.
+
+
+====================================================================
+7. ADVANTAGES OF THIS SYSTEM
+====================================================================
+- Runs in real time on CPU: the reasoning layer itself costs ~0.6ms per
+  frame, under 1% of the unavoidable ~106ms detection cost -- the
+  engineering layer is essentially free compared to perception.
+- Modular and config-driven: ROI polygons, all distance/time thresholds,
+  and even the abandoned-bag/carried-bag grace windows are external
+  config.json values, not hardcoded constants -- a different deployment
+  site can retune behavior without touching code.
+- No training/fine-tuning required: built entirely on off-the-shelf,
+  pretrained YOLOv8n + ByteTrack -- zero labeled training data needed for
+  the reasoning layer itself (only the underlying detector's existing
+  COCO-pretrained weights are used).
+- Validated against real ground truth, not just qualitative "it looked
+  right": VIRAT precision/recall/ID-switch numbers, not just "we watched
+  the video and it seemed fine."
+- Extremely well-instrumented failure history: 37 real, root-caused,
+  regression-tested defects, each with a real-footage reproduction --
+  which is a genuinely rare level of engineering discipline for a solo/
+  internship-scale project, and directly demonstrable in an interview.
+- Persisted, queryable history via the event log + MCP server: a run's
+  alert history survives the process and can be interrogated afterward
+  (by a script, or by any MCP-compatible LLM client) instead of being lost
+  the moment the window closes.
+
+====================================================================
+8. DISADVANTAGES / LIMITATIONS (state these before someone else finds them)
+====================================================================
+- No Re-ID: track identity is not stable across occlusion/pose change.
+  Measured directly: 3 ID switches against only 3 ground-truth tracks in
+  one ~5-minute evaluation clip.
+- Owner-identity is not enforced anywhere: any nearby person (not
+  necessarily the true owner) can clear an ABANDONED bag back to ATTENDED,
+  and the stored owner_id itself drifts to whoever is currently closest --
+  it is not a stable, verified identity. (Root cause is the same missing
+  Re-ID capability.)
+- Scale-dependent recall drop: on a wide-overview camera shot where 93.5%
+  of people are under 40px tall in the model's actual input space, recall
+  drops to single digits. This is a known, general limitation of small
+  ("nano") detection models on small/distant objects, not specific to this
+  engineering layer -- but it directly limits which camera placements this
+  system is currently reliable for.
+- The pose-based suspicious-activity signal is architecturally complete and
+  unit-tested, but has NOT been empirically confirmed to fire correctly on
+  real violent/altercation footage -- its numeric thresholds are unvalidated
+  defaults, not calibrated values.
+- Only Objective 1's underlying perception (person detection) has a
+  quantitative ground-truth accuracy number. Objectives 2 and 3
+  (abandoned-object, suspicious-activity) are validated qualitatively
+  (real-video testing + bug-fixing) rather than against an equivalent
+  frame-level or event-level ground truth.
+- No appearance/lighting robustness testing beyond the specific real clips
+  used; no explicit handling of multiple simultaneous cameras, adversarial
+  conditions, or extended 24/7 continuous-operation stress testing beyond
+  the memory-eviction mechanism's design intent.
+- CPU-only inference at ~9.4 FPS combined throughput is below a
+  conventional real-time video target (24-30 FPS); this is a functional
+  prototype, not a production-ready deployment as-is.
+
+====================================================================
+9. FUTURE WORK (and specifically how each limitation above gets addressed)
+====================================================================
+- Appearance-based Re-ID: the single highest-leverage future addition.
+  Concretely available without a new dependency -- this exact project's
+  installed `ultralytics` package already bundles BoT-SORT and Deep OC-SORT
+  tracker backends with an optional `with_reid` appearance-matching mode
+  (auto-downloads a small dedicated Re-ID embedding model). Swapping the
+  tracker is not a drop-in change (thresholds throughout the engineering
+  layer were calibrated against ByteTrack's specific behavior and would
+  need re-verification against real footage), but the path is concrete, not
+  speculative.
+- Empirical calibration of the pose-based limb-motion thresholds
+  (variance_scale, activation_threshold) against confirmed real altercation
+  footage, to convert "architecturally complete" into "empirically
+  validated."
+- A larger detector variant or higher input resolution to address the
+  small-object recall drop, with the accompanying latency cost measured
+  explicitly (not assumed free).
+- Event-level ground-truth evaluation for Objectives 2 and 3, using
+  annotation types that map cleanly onto them (flagged in the paper as a
+  real methodological trap to avoid: forcing an unrelated event label, like
+  VIRAT's "entering a facility," to stand in for a conceptually different
+  objective like restricted-zone polygon containment, would produce a
+  number that looks quantitative but measures the wrong thing).
+- GPU-accelerated inference / edge-hardware optimization to close the gap
+  to real-time (24-30 FPS) throughput.
+- Camera calibration / homography-based true 3D distance correction, to
+  replace the current height-scaled pixel-distance heuristics (Section 3.2)
+  with an actual real-world-distance estimate.
+
+
+====================================================================
+10. TOOLS AND LIBRARIES USED (what, and specifically why THIS one)
+====================================================================
+- Python 3.12 -- the language. Chosen for the ML ecosystem (every library
+  below is Python-first) and because rapid iteration on heuristics/
+  thresholds mattered more here than raw execution speed.
+- Ultralytics YOLOv8 (yolov8n.pt) -- the object detector. "n" (nano) variant
+  specifically chosen for CPU-viable real-time inference; a larger variant
+  would be more accurate (see Section 8) but proportionally slower.
+- ByteTrack (via Ultralytics' `tracker="bytetrack.yaml"` integration) -- the
+  multi-object tracker, assigning persistent-ish IDs across frames via
+  motion (Kalman filter prediction) + bounding-box IoU matching. No
+  appearance model (this is the Re-ID gap discussed throughout).
+- yolov8n-pose.pt -- a second, separately-loaded pose-estimation model
+  (COCO-17 keypoint layout), used ONLY for the gated limb-motion signal
+  (Section 3.3b). Lazily loaded -- never even downloaded into memory unless
+  a frame actually needs it.
+- OpenCV (cv2) -- video I/O (VideoCapture), frame resizing, and all overlay
+  drawing (rectangles, text). The one dependency touching literally every
+  frame.
+- PyTorch (torch) -- the tensor/inference backend underneath Ultralytics;
+  not called directly by this project's own code, but required by it.
+- NumPy -- array operations (letterbox padding canvas construction,
+  vectorized keypoint math).
+- SQLite (via Python's built-in `sqlite3`, no external DB server) -- the
+  persisted event log. Chosen specifically because it needs zero
+  setup/server process, produces a single portable file, and fully covers
+  this project's actual requirement (single-writer, occasional-reader,
+  small data volume) -- a heavier client-server database would be
+  unjustified complexity here.
+- MCP Python SDK (`mcp`, specifically `FastMCP`) -- exposes the event log's
+  query functions as standardized tools an LLM agent (or any MCP-compatible
+  client) can call. See Section 12.
+- unittest (Python standard library) -- all 66 automated tests. Chosen over
+  pytest specifically because it's zero-extra-dependency (already available
+  in every Python install), which matters for a project whose own
+  environment-check script (check.py) explicitly audits for exactly this
+  kind of dependency completeness.
+- Git / GitHub -- version control.
+
+
+====================================================================
+11. MATH/ALGORITHMS QUICK-REFERENCE (for rapid recall under pressure)
+====================================================================
+- Ray casting / point-in-polygon (even-odd rule): count edge crossings of a
+  horizontal ray from the test point; odd = inside. O(n) in polygon
+  vertices. Section 3.1.
+- Euclidean distance: sqrt(dx^2 + dy^2). Used everywhere proximity matters
+  (owner-bag distance, duplicate-track suppression, ghost-box dedup).
+- Hysteresis (dual-threshold state transition): different thresholds for
+  "enter" vs. "exit" a state, to create a dead zone that absorbs noise/
+  jitter at the boundary. Section 3.2. (Same principle as a thermostat.)
+- Perspective/scale normalization: dividing a raw pixel measurement (speed,
+  distance) by the tracked object's own detected size (height), so the
+  result is roughly invariant to how far the object is from the camera.
+  Sections 3.2, 3.3a.
+- Exponential Moving Average (EMA): new = beta*old + (1-beta)*current.
+  Weights recent samples more than old ones, geometrically decaying.
+  Trades off responsiveness vs. noise smoothing via the beta parameter
+  (beta closer to 1 = smoother/slower; closer to 0 = more reactive/noisier).
+  Section 3.3b.
+- Statistical anomaly / outlier detection (z-score-adjacent): flag a
+  current value that's a large multiple of a recent rolling baseline mean,
+  rather than an absolute cutoff. Section 3.3a.
+- Variance: mean squared deviation from the mean, i.e. how much a signal
+  moves around over a window -- used as the actual "suspicious limb motion"
+  signal, not raw position, because absolute position doesn't distinguish
+  "unusual pose held still" from "flailing." Section 3.3b.
+- IoU (Intersection over Union): intersection_area / union_area of two
+  boxes. Used both inside ByteTrack's own association logic and in this
+  project's own ground-truth evaluation harness (ties a predicted box to a
+  ground-truth box if IoU >= 0.5).
+- Precision / Recall: precision = TP/(TP+FP) ("of what I flagged, how much
+  was real"); recall = TP/(TP+FN) ("of what was real, how much did I
+  catch"). Section 8's headline trade-off (scale-dependent recall drop)
+  is precisely a recall problem, not a precision problem -- worth being
+  able to say precisely which one and why that distinction matters (a
+  system with high precision/low recall under-alerts silently; high
+  recall/low precision over-alerts and trains operators to ignore it --
+  different failure modes with different real-world consequences).
+- Kalman filter (used internally by ByteTrack, not implemented by this
+  project, but you should be able to explain it if asked "how does the
+  tracker predict motion"): a recursive estimator that maintains a belief
+  about an object's position AND velocity, predicts forward one step each
+  frame, then corrects that prediction against the actual new detection,
+  weighting the correction by how uncertain the prediction vs. the
+  measurement currently is. This is *why* ByteTrack can survive a
+  one-frame missed detection without losing the track -- it can predict
+  where the object probably is and keep the ID alive, briefly, without a
+  fresh detection to confirm it.
+- Letterbox scale/pad math: Section 4.1.
+
+
+====================================================================
+12. THE MCP PART, EXPLAINED
+====================================================================
+See also the dedicated live answer given in this conversation -- this is
+the condensed, written-down version.
+
+WHAT MCP IS (in general): Model Context Protocol is a standardized way for
+an LLM-based agent/client to discover and call a set of "tools" (functions
+with typed inputs/outputs) exposed by some external system, without the
+agent needing custom, bespoke integration code for every different system
+it might want to talk to. Think of it like a very lightweight, agent-facing
+API contract: a server declares "here are the functions you can call, here
+are their parameters," and any MCP-compatible client (an LLM chat app, an
+agent framework, etc.) can call them the same way regardless of what's
+actually behind them.
+
+WHAT THIS PROJECT'S MCP SERVER DOES: mcp_server/server.py exposes FOUR
+read-only tools over the SQLite event log (src/event_log.py):
+  - list_runs()            -- every recorded video-processing run
+  - list_alerts(...)       -- alert events, filterable by run/state/time
+  - get_track_history(...) -- full state-transition timeline for one
+                               specific tracked person or bag
+  - get_run_summary(...)   -- alert counts + unique-entity counts for a run
+Each is just a thin wrapper calling the corresponding function in
+src/event_log.py, decorated with `@mcp.tool()` from the `FastMCP` class,
+which handles all the protocol plumbing (schema generation from the Python
+type hints, request/response serialization) automatically -- you don't
+write any protocol-level code, you write normal Python functions and
+decorate them.
+
+WHY IT WAS BUILT: this project's core pipeline (detection, tracking, state
+reasoning) has nothing inherently to do with LLMs or agents. The MCP server
+was added specifically to make the system's *output history* queryable in
+natural language by an agent -- e.g. "what alerts happened between 2pm and
+3pm" or "show me everything that happened to bag #7" -- without writing a
+bespoke natural-language interface. This is explicitly an OPERATIONAL/
+TOOLING addition, not a detection-accuracy contribution (the paper itself
+says this directly) -- it doesn't change what the system detects, only what
+you can *ask* about a completed run afterward.
+
+WHY IT RUNS AS A SEPARATE PROCESS (architecturally important, likely to be
+asked about): the live video pipeline is a tight, blocking, synchronous
+loop (read frame -> infer -> update state -> draw -> repeat, as fast as
+possible). MCP servers are typically async (built to wait on and respond to
+requests, not to run a hot loop). Trying to run both in the same process
+would mean either the video loop blocking every time someone asks a
+question, or a genuine concurrency redesign (running an async event loop
+alongside a blocking one, safely). Instead, they're two totally separate
+processes that share only a SQLite *file* on disk. The live pipeline writes
+to it (fire-and-forget, on state changes only); the MCP server only ever
+reads it. Neither can crash the other; neither needs to know the other is
+running.
+
+WHY THIS MATTERS BEYOND THIS PROJECT (career context, worth saying out
+loud if asked): a computer-vision systems project on its own demonstrates
+one skill set (perception, tracking, real-time systems). Exposing that
+system's results through MCP demonstrates a different, currently very
+in-demand skill: making an existing system's data queryable/actionable by
+an LLM agent, which is exactly the kind of "agentic tooling" integration a
+lot of current AI-engineer job postings ask for. It's a legitimate,
+non-padded extension of real, already-built work -- not a bolted-on buzzword.
+
+IS AN LLM ACTUALLY CONNECTED TO THIS RIGHT NOW? No -- be precise about this,
+it came up directly while rehearsing the demo. `demo_mcp_query.py` calls the
+four tools with hardcoded Python (`server.mcp.call_tool("list_runs", {})`,
+then `list_alerts` with a hardcoded run_id, etc.) -- a human decided that
+call sequence in advance, an LLM did not. What's real and verified: the tool
+layer itself is genuinely MCP-spec-compliant and returns correct data when
+called (confirmed against a real recorded run, not synthetic data). What's
+NOT yet built or exercised: an actual MCP client (Claude Desktop, Claude
+Code, or any agent framework with MCP support) connecting to
+`mcp_server/server.py`, receiving a natural-language question, and an LLM
+itself reasoning about which tool to call and synthesizing the answer. Say
+it exactly that way if asked -- "the infrastructure is LLM-ready, an LLM
+hasn't actually been wired into it yet" -- rather than either overclaiming
+("it uses an LLM") or underclaiming ("it's just a database").
+
+HOW TO DEMO IT: see Section 14 below.
+
+
+====================================================================
+13. NOTES FOR ORAL DEFENSE / INTERVIEW (things to have ready)
+====================================================================
+- "Why isn't this novel research?" -> Because none of the individual
+  techniques (dwell-time state machines, polygon containment, hysteresis)
+  are new -- they're well-established in surveillance literature and
+  commercial VMS software. The contribution is the *integration* of three
+  objectives into one lightweight layer, the *validation methodology*
+  (real ground truth, not just "it looked right"), and the *honest,
+  measured characterization* of exactly where and why it fails. Say this
+  proactively -- it's a strength (intellectual honesty), not a weakness to
+  hide.
+- "What's the actual accuracy of your abandoned-object/intrusion
+  detection?" -> Be precise: the QUANTITATIVE ground-truth number (75.8%
+  precision / 54.9% recall) is for the underlying PERSON DETECTION, not for
+  the abandoned-object or intrusion REASONING specifically -- those two
+  were validated qualitatively (real-video testing + defect-driven fixing),
+  not against an equivalent frame/event-level ground truth. Do not blur
+  this distinction; the paper is explicit about it and you should be too.
+- "Why not just train an end-to-end model for this?" -> Data availability
+  (no labeled "abandoned object" training set was built or used), inference
+  cost (a full spatio-temporal action model is heavy relative to the CPU/
+  edge deployment target), and interpretability (a state machine's decision
+  is auditable step by step; a learned end-to-end classifier's is not) --
+  all three are real, defensible reasons, not just "didn't have time."
+- "What would you do differently with more time?" -> Re-ID (Section 9) is
+  the single highest-leverage answer; be ready to explain concretely (BoT-
+  SORT/Deep OC-SORT are already available, not a from-scratch build) rather
+  than gesturing vaguely at "better tracking."
+- "How did you find these 37 bugs?" -> Be specific: systematic testing
+  against real, diverse footage (six datasets), not just synthetic test
+  cases -- and for the hardest ones (this session's), direct frame-by-frame
+  instrumentation of the actual pipeline against real video, re-verified
+  after each fix, not just trusted after the unit tests passed. Two fixes
+  this session were caught as *insufficient* specifically because of that
+  real-footage re-verification discipline.
+- "Does this use an LLM?" -> No, not the core pipeline (detection, tracking,
+  state reasoning are all classical CV/heuristics, zero LLM calls). The MCP
+  server (Section 12) exposes the results in an LLM-ready way, but no LLM
+  has actually been connected to query it yet -- be precise about that
+  distinction, it's the kind of thing worth getting exactly right rather
+  than rounding up.
+
+
+====================================================================
+14. DEMO RUNBOOK (exact commands, in order)
+====================================================================
+1. (Optional) Confirm everything's green first:
+     python -m unittest discover -s tests
+
+2. Run the live pipeline with event logging on -- this is the visual proof,
+   and it needs a FRESH run right before any real demo, not old data (see
+   Section 15, item 1):
+     python main.py --source "<video path>" --event-log demo_events.db
+   Watch for a box changing color / label changing to WARNING / ABANDONED /
+   INTRUDER -- THIS is the alarm. It is not cosmetic: it is driven directly
+   by the same threshold logic described in Section 3, changing state at
+   the exact frame the threshold actually fires. Do not build a separate
+   fake siren/banner for this -- the color-coded overlay already answers
+   "does this alert after a threshold, live, on screen." If asked "how
+   would this alert a real operator," answer verbally ("this would drive an
+   operator-facing notification in production; the visual state change here
+   is that same signal") rather than fake notification infrastructure that
+   doesn't exist.
+   Use `]` or `f` to skip forward 10s at a time if the interesting event is
+   a couple minutes in and you don't want dead air during the demo (this
+   works correctly now -- fixed this session, see Section 6, Theme C /
+   bugs_and_debugs.txt #37; it used to corrupt tracking state on seek).
+   Press `q` to stop, or pass `--max-frames N` to stop automatically.
+
+3. Once that window closes, show the database/MCP payoff -- this is the
+   "it remembers, and I can query it" beat, and should come right after the
+   live run so the connection is obvious:
+     python demo_mcp_query.py demo_events.db
+   Say "queried via MCP" out loud here -- this is the part that
+   differentiates the demo from a toy detector.
+
+A gotcha already hit once, worth knowing about in advance: if step 3 is
+pointed at a database path that a prior `main.py --event-log <path>` run
+never actually wrote to (wrong filename, typo, or a run started without
+--event-log), it used to crash with a raw sqlite3 "no such table: runs"
+traceback. Fixed by having demo_mcp_query.py call the same schema-init
+function the live pipeline uses before querying (idempotent, safe even on
+a database that already has data) -- it now prints a clean "No runs found"
+message instead. Moral: always double-check the filename passed to
+--event-log in step 2 matches the filename passed to demo_mcp_query.py in
+step 3, exactly.
+
+
+====================================================================
+15. WHAT'S LEFT (open items as of 2026-07-22, so future-you doesn't have
+    to reconstruct this from scratch)
+====================================================================
+- REPO HYGIENE (do this first, it's the easiest to lose): nothing from this
+  session, or apparently several sessions before it, has been committed to
+  git. `git status` shows the fixes, the paper, the resume, and this file
+  all sitting as uncommitted changes. Safe on disk; no version history, no
+  way to share it, no recovery if something goes wrong locally.
+- CODE, deliberately deferred (not forgotten):
+  - Why yolov8n actually misses a real, stationary bag for 21+ seconds
+    (bugs_and_debugs.txt #34/#35) -- the system now tolerates the gap,
+    nobody has explained its root cause (lighting? occlusion? nano-model
+    recall limit on this specific object?).
+  - The Re-ID tracker upgrade (BoT-SORT/Deep OC-SORT, Section 9) --
+    scoped, concretely available, not started.
+  - Owner-identity-gated bag reconnection (Section 8) -- confirmed as a
+    real gap, deliberately left unfixed given the ID-churn trade-off; would
+    need the Re-ID upgrade above to do properly.
+- PAPER, closer to done than the code but not submission-ready:
+  - Numbers were stale as of this session's earlier work (31 defects/49
+    tests) and have now been corrected throughout (paper draft, this file,
+    resume.txt, PROJECT_DOCUMENTATION.txt) to 37/66 -- if you fix more bugs
+    later, remember to propagate the new count to all four places again.
+  - Still has literal `[Author Name]` / `[Affiliation / Institution]`
+    placeholders, and is still "not yet formatted in the IEEEtran LaTeX
+    template" (content-complete, format-incomplete).
+  - Citations are standard/correct by common citation but the paper itself
+    flags they still need a publisher-record cross-check before
+    camera-ready.
+  - If you want a *stronger* paper rather than just a complete one: the
+    pose-based suspicious-activity signal has never been run against real
+    violent footage (UCF-Crime/Avenue are already under data/raw), and
+    AVSS 2007 turns out to ship its own frame-range object-event
+    annotations -- a real, concrete opportunity to turn the abandoned-object
+    objective's currently-qualitative validation into a quantitative one,
+    not previously known to be available when Section VI-D was written.
+- DEMO: functionally verified end-to-end this session. Just remember
+  Section 14's warning -- generate fresh event-log data right before the
+  actual demo, don't rely on old runs mixed with pre-fix behavior.
+
+
+====================================================================
+END OF STUDY NOTES
+====================================================================

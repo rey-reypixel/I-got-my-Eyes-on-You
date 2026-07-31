@@ -3,18 +3,18 @@ Phase 2 Progress Report
 
 Completed Tasks
 ---------------
-- Implemented the main video inference loop in src/detection.py.
-- Integrated Ultralytics YOLO tracking with ByteTrack persistence.
+- Implemented the main video inference loop in src/detection.py. It now actually looks at things, which feels like progress.
+- Integrated Ultralytics YOLO tracking with ByteTrack persistence, so objects keep the same identity across frames instead of getting a new one every time they blink. Unlike some people's group chat nicknames.
 - Routed detections through the tracking update layer using tracker IDs.
-- Added color-coded bounding-box overlays tied to the state-machine labels.
-- Verified that the updated modules compile successfully.
+- Added color-coded bounding-box overlays tied to the state-machine labels. Green means fine. Red means "we need to talk."
+- Verified that the updated modules compile successfully. Compiling: the bare minimum, achieved with confidence.
 
 Current Status
 --------------
-- Detection pipeline is now wired for frame-by-frame processing and visualization.
-- State labels remain consistent with the tracking schema: NORMAL, ATTENDED, WARNING, ABANDONED, PANIC, and INTRUDER.
+- Detection pipeline is now wired for frame-by-frame processing and visualization. Could this pipeline BE any more wired?
+- State labels remain consistent with the tracking schema: NORMAL, ATTENDED, WARNING, ABANDONED, PANIC, and INTRUDER. (For the record, "PANIC" is also an accurate description of most debugging sessions this phase.)
 
 Next Steps
 ----------
 - Move forward to benchmarking and evaluation integration.
-- Validate the pipeline on sample video inputs and refine thresholds as needed.
+- Validate the pipeline on sample video inputs and refine thresholds as needed, because right now the thresholds are running on vibes and good intentions.

@@ -3,16 +3,16 @@ I-GOT-MY-EYES-ON-YOU
 Project Overview
 ----------------
 Project Name: I-got-my-Eyes-on-You
-Purpose: Build an AI-powered CCTV surveillance system that can detect suspicious activities, unauthorized access, and abandoned objects in video streams.
+Purpose: Build an AI-powered CCTV surveillance system that can detect suspicious activities, unauthorized access, and abandoned objects in video streams. Could this purpose statement BE any more of a mission?
 
-The project is a summer internship prototype focused on creating an intelligent monitoring pipeline that can analyze video frames, track people and objects, assign behavioral states, and log results for evaluation.
+The project is a summer internship prototype focused on creating an intelligent monitoring pipeline that can analyze video frames, track people and objects, assign behavioral states, and log results for evaluation. In short: it watches things and takes notes, which is more than can be said for some people in meetings.
 
 Why This Project Was Built
 --------------------------
-- To reduce the need for constant human monitoring in CCTV systems.
+- To reduce the need for constant human monitoring in CCTV systems. Nobody wants to be the person staring at nine grainy monitors at 3am.
 - To make surveillance more intelligent by combining object detection, tracking, and state-based reasoning.
 - To explore how AI can support threat understanding in security footage.
-- To build a modular system that can be improved later with better datasets, models, and thresholds.
+- To build a modular system that can be improved later with better datasets, models, and thresholds — because "later" is doing a lot of heavy lifting in every engineering plan ever written.
 
 Project Goal
 ------------
@@ -22,6 +22,8 @@ The goal was to create a working proof-of-concept pipeline that can:
 - track identities across frames,
 - identify suspicious or risky states,
 - log telemetry for performance assessment.
+
+Five bullet points. No pressure.
 
 What We Did
 -----------
@@ -39,9 +41,11 @@ What We Did
 9. Added tests for the metrics and tracking pipeline.
 10. Verified the workflow using a sample VIRAT video.
 
+Ten steps. Could this project's to-do list BE any longer? (Don't answer that. It gets longer. See: the rest of this document.)
+
 Project Architecture
 --------------------
-The system follows a simple AI video-analysis pipeline:
+The system follows a simple AI video-analysis pipeline. "Simple" is doing some of the same heavy lifting as "later" up above, but bear with it:
 
 Input Video
   -> Frame extraction
@@ -54,7 +58,7 @@ Input Video
 Main Code Modules
 -----------------
 - src/detection.py
-  - Main detection engine
+  - Main detection engine. The one everyone else calls when things get weird.
   - Handles video opening, frame resizing, inference, and visualization
   - Contains helper functions for polygon containment, abandoned-object logic, kinematics, and panic detection
 
@@ -65,7 +69,7 @@ Main Code Modules
 
 - src/state_machine.py
   - Stores in-memory state for tracked people, bags, and behavioral confidence history
-  - Implements thread-safe state containers
+  - Implements thread-safe state containers (thread-safe as in "won't collapse if two frames look at it funny at the same time")
 
 - src/engineering_layers.py
   - Connects the main reasoning functions to the tracking pipeline
@@ -81,17 +85,19 @@ Main Code Modules
 
 - src/event_log.py
   - SQLite-backed persisted event log: every alert/state-change transition during a
-    main.py run (when started with --event-log <path>) is recorded here
+    main.py run (when started with --event-log <path>) is recorded here, so the system
+    finally has a memory that outlives the process. Progress.
   - Read/write API used by both MultiModelDetectionEngine and mcp_server/server.py
 
 - mcp_server/server.py
   - Standalone MCP server (official `mcp` Python SDK) exposing read-only query tools
     over src/event_log.py's SQLite database: list_runs, list_alerts, get_track_history,
-    get_run_summary. Decoupled from the live video pipeline -- it only ever reads the
-    database file, never shares a process or thread with the OpenCV loop.
+    get_run_summary. Deliberately decoupled from the live video pipeline -- it only ever
+    reads the database file, never shares a process or thread with the OpenCV loop, because
+    nobody needs that kind of drama.
 
 - tests/
-  - Contains regression tests for metrics and tracking state handling
+  - Contains regression tests for metrics and tracking state handling. The system's designated adult in the room.
 
 What the System Tries to Detect
 -------------------------------
@@ -103,29 +109,34 @@ What the System Tries to Detect
      near-stationary for a sustained window (stationary_counter), a second model
      (yolov8n-pose.pt) is invoked on that frame to catch the case centroid motion
      alone cannot see -- a person standing still while limbs move violently
-     (fighting, vandalism, shoplifting). The signal is the rolling variance of
-     wrist/elbow keypoints relative to a torso reference point, height-normalized
-     and confidence-gated per keypoint, smoothed via the same EMA used for the
-     rest of the behavioral state and combined into SUSPICIOUS_ACTIVITY alongside
-     the kinematic-spike flag. Because it only runs when gated in, it does not
-     pay inference cost on every person every frame.
+     (fighting, vandalism, shoplifting). Because standing dead still while throwing
+     hands is, apparently, a real gap in "did they move" logic. The signal is the
+     rolling variance of wrist/elbow keypoints relative to a torso reference point,
+     height-normalized and confidence-gated per keypoint, smoothed via the same EMA
+     used for the rest of the behavioral state and combined into SUSPICIOUS_ACTIVITY
+     alongside the kinematic-spike flag. Because it only runs when gated in, it does
+     not pay inference cost on every person every frame -- it's selectively nosy, not
+     universally nosy.
 
 2. Unauthorized access
    - Based on whether a tracked person enters a defined polygon/region of interest
    - The ROI is defined by polygon vertices in the detection engine
+   - There is an invisible line. You were not supposed to cross the invisible line.
 
 3. Abandoned objects
    - Tracks bags or assets and determines if they are left unattended for too long
    - Uses state transitions such as ATTENDED -> WARNING -> ABANDONED
-   - Applies dynamically stretched vertical proximity constraints to prevent false abandoned warnings for owners standing next to bags on the floor
+   - Applies dynamically stretched vertical proximity constraints to prevent false
+     abandoned warnings for owners standing next to bags on the floor (so it doesn't
+     panic just because someone bent down to tie their shoe)
 
 Core Logic Details
 ------------------
 - The pipeline builds per-person tracking memory.
-- Each tracked entity stores path history, velocity history, state label, panic counter, and previous frame centroid coordinate history.
+- Each tracked entity stores path history, velocity history, state label, panic counter, and previous frame centroid coordinate history. It remembers more about you than most acquaintances do.
 - Bags are tracked separately with temporal state attributes such as owner_id, center coordinates, current state, and timer.
 - The system checks closest human keys and stretches proximity constraints to handle vertical height offsets.
-- The system uses simple state-machine logic to interpret what is happening to each object in the scene.
+- The system uses simple state-machine logic to interpret what is happening to each object in the scene. "Simple" here means "less simple than it sounds," a running theme of this document.
 
 Important Implementation Concepts
 --------------------------------
@@ -135,14 +146,16 @@ Important Implementation Concepts
 
 2. Tracking
    - Uses Ultralytics tracking with ByteTrack persistence.
-   - Track IDs are preserved across frames.
+   - Track IDs are preserved across frames. Mostly. See the bugs log for the "mostly."
 
 3. State Reasoning
    - Each tracked person carries independent per-detector flags (intruder_flag,
      panic_flag, kinematic_suspicious_flag, limb_suspicious_flag), each with its
      own recovery condition, instead of one field multiple detectors could
-     silently overwrite. The single displayed label is resolved once per frame
-     from a fixed priority order: INTRUDER > PANIC > SUSPICIOUS_ACTIVITY > NORMAL
+     silently overwrite (which used to happen, and it was exactly as messy as it
+     sounds -- imagine four people trying to update the same whiteboard at once).
+     The single displayed label is resolved once per frame from a fixed priority
+     order: INTRUDER > PANIC > SUSPICIOUS_ACTIVITY > NORMAL
      (src/tracking.py: resolve_person_state).
    - Labels used:
      - NORMAL
@@ -179,12 +192,13 @@ Model Used
 ----------
 - YOLOv8n
 - Model file: yolov8n.pt
-- This was the default detection model used for the prototype.
+- This was the default detection model used for the prototype. The "n" is for nano, which is also roughly how much patience the CPU has for anything bigger.
 - It was loaded through the Ultralytics YOLO interface.
 - Secondary model: yolov8n-pose.pt, loaded lazily and only invoked on frames
   where the gated limb-motion check triggers (see Suspicious Activities above).
   Its detections are matched back to the primary model's tracked person IDs by
-  nearest centroid, since it runs independently and has no tracker/IDs of its own.
+  nearest centroid, since it runs independently and has no tracker/IDs of its own --
+  it shows up, does its one job, and leaves without small talk.
 
 Setup Instructions
 ------------------
@@ -202,10 +216,12 @@ Setup Instructions
    - python benchmark/custom_eval.py --video-source <video_path> --max-frames <n>
 7. Generate the summary report:
    - python metrics_report/summarize_metrics.py
-8. Record a queryable alert history for a run, then inspect it via MCP:
+8. Record a queryable alert history for a run, then inspect it via MCP (because a
+   surveillance system that forgets everything the moment you close it is just
+   expensive anxiety, not a system):
    - python main.py --source <video_path> --no-show --event-log surveillance_events.db
    - python mcp_server/server.py --db-path surveillance_events.db
-     (or point an MCP client, e.g. Claude Desktop's config, at this script + --db-path arg)
+     (or point any MCP-compatible client at this script + --db-path arg)
 
 Tools Used
 ----------
@@ -226,7 +242,7 @@ The repository includes references to multiple surveillance and anomaly datasets
 - Avenue Dataset
 - UFC_Crime-related activity samples
 
-These were used as potential benchmark sources for evaluation and future experiments.
+These were used as potential benchmark sources for evaluation and future experiments. A whole cast of surveillance footage, none of which knew it was being watched by something that was, itself, being watched (by us. Recursion. Sorry.)
 
 What Results We Got
 -------------------
@@ -249,7 +265,7 @@ Measured performance from the verification run:
 
 Important note:
 - The benchmark run was performed on a sample video and on the available hardware setup.
-- The observed frame rate was far below the ideal real-time target of 30 FPS, so the current system should be viewed as a functional prototype rather than a production-grade real-time system.
+- The observed frame rate was far below the ideal real-time target of 30 FPS, so the current system should be viewed as a functional prototype rather than a production-grade real-time system. It's less "ready for deployment" and more "ready to be very earnestly improved upon," which is a phase every project goes through, some of them publicly.
 
 What the Results Mean
 ---------------------
@@ -269,7 +285,7 @@ Strengths of the Project
 - Modular design with clear separation between detection, tracking, and state reasoning.
 - Fully configurable through external configuration files (`config.json`).
 - Dynamic ROI coordinate scaling supporting arbitrary video frame sizes.
-- Memory eviction policy (TTL approach) under thread-safe locks to prevent OOM errors during 24/7 runs.
+- Memory eviction policy (TTL approach) under thread-safe locks to prevent OOM errors during 24/7 runs. It knows when to let go. Emotionally mature, for a dictionary.
 - Detailed environment checks and automated test coverage.
 - Benchmarking support and latency metrics summary reports built-in.
 
@@ -279,15 +295,17 @@ A code review found that the previous "behavioral smoothing" EMA path (src/track
 process_behavioral_smoothing) was fed the YOLO person-detection confidence score, not any
 actual behavior/anomaly signal -- it only reflected how clearly a person was detected, and
 silently competed with the kinematic-displacement check for the same SUSPICIOUS_ACTIVITY
-state field. Separately, PANIC had no recovery path back to NORMAL, and INTRUDER / PANIC /
-SUSPICIOUS_ACTIVITY had no defined priority when multiple conditions applied to the same
-tracked person simultaneously. Both have been fixed:
+state field. Could that function BE any more confused about its own job? Separately, PANIC
+had no recovery path back to NORMAL, and INTRUDER / PANIC / SUSPICIOUS_ACTIVITY had no
+defined priority when multiple conditions applied to the same tracked person simultaneously.
+Both have been fixed:
 
 1. State machine redesign (src/tracking.py):
    - Each detector now writes to its own independent flag (intruder_flag, panic_flag,
      kinematic_suspicious_flag, limb_suspicious_flag) instead of one shared "state" field.
    - panic_flag now recovers via a cooldown counter (panic_recovery_frames, default 30
-     frames) instead of latching forever.
+     frames) instead of latching forever. Nobody should be permanently flagged as panicking
+     over one bad frame. We've all had one bad frame.
    - kinematic_suspicious_flag is recomputed every frame from the current smoothed
      displacement average, so it recovers on its own once motion settles.
    - The single displayed "state" label is resolved once per frame via resolve_person_state()
@@ -321,15 +339,16 @@ tracked person simultaneously. Both have been fixed:
 Not yet validated: this has only been exercised via unit tests with synthetic keypoints.
 It has not yet been run against a real video with yolov8n-pose.pt to check the variance_scale
 default (0.02) and activation_threshold produce sensible results on real footage -- those
-will very likely need empirical recalibration before being cited in the paper.
+will very likely need empirical recalibration before being cited in the paper. In other words:
+it works in theory, and theory has famously never once betrayed anybody.
 
 MCP Server: Queryable Alert/Event History (2026-07-21)
 --------------------------------------------------------
 The live pipeline previously kept all tracking state in memory only -- nothing survived
 after a run ended, so there was no way to ask "what happened during this run" after the
-fact. Added a persisted event log and a standalone MCP (Model Context Protocol) server
-that queries it, so an LLM agent can ask natural questions about a recorded run's alert
-history.
+fact. The system had the memory of a goldfish with a grudge it couldn't articulate. Added
+a persisted event log and a standalone MCP (Model Context Protocol) server that queries it,
+so an LLM agent can ask natural questions about a recorded run's alert history.
 
 - src/event_log.py: a SQLite-backed store with two tables (runs, events). Whenever
   main.py is started with --event-log <path>, MultiModelDetectionEngine records every
@@ -342,6 +361,7 @@ history.
   (alert counts and unique-entity counts for a run). It only ever reads the SQLite file --
   it shares no process or thread with the live OpenCV video loop, by design, to avoid the
   complexity (and risk) of interleaving an async MCP server with a blocking video loop.
+  Two systems, healthy boundaries, no shared process. Relationship goals, honestly.
 - Verified with a real run, not just synthetic data: ran main.py with --event-log against
   a real clip, then queried the resulting database through the actual MCP tool-call
   mechanism (not just schema/registration checks) and confirmed correct results, including
@@ -349,20 +369,89 @@ history.
 - Covered by tests/test_event_log.py (read/write API), tests/test_event_log_integration.py
   (engine wiring: new alerts logged, unchanged states not re-logged, recoveries logged but
   excluded from list_alerts, bag vs person entity typing, run summary aggregation).
+- Important precision, since it's easy to overstate: the tool layer is genuinely MCP-spec-
+  compliant and LLM-ready (any real MCP client could call these four tools and get correct
+  results back), but no LLM has actually been wired up to it yet. demo_mcp_query.py calls
+  the tool functions directly with hardcoded Python (see the 2026-07-22 section below) --
+  it demonstrates the *data path* works, not that an LLM has ever actually decided which
+  tool to call. Say it that way if asked; "an LLM agent can ask natural questions about a
+  run" describes what this infrastructure enables, not something that has happened yet.
 - Deliberately out of scope for now: querying state *while* a video is actively being
   processed (would require running the MCP server's async event loop alongside the
   blocking OpenCV loop in the same process -- a real architecture change, not attempted
   here). Also out of scope: the RAG/vector-search and agentic-orchestration pieces
   originally discussed alongside this (semantic search over alerts, a LangGraph-based
-  summary agent) -- deferred to a future project by design, not built here.
+  summary agent) -- deferred to a future project by design, not built here. We know our
+  limits. It's very unlike us.
+
+Bag Tracking Overhaul, Seek/Rewind State Reset, and MCP Demo Verification (2026-07-22)
+------------------------------------------------------------------------------------------
+Real-footage testing (ABODA video1.avi, AVSS 2007 AVSSS07_EASY.mpg) surfaced two more
+bag-tracking failure modes on top of everything already logged, plus a genuine bug in the
+rewind/skip feature that had nothing to do with bags at all. Could this pipeline's bags BE
+any more high-maintenance? Apparently, yes.
+
+1. Left-behind bags losing their box entirely, discovered in two different ways on two
+   different real clips, both eventually traced to the same root cause:
+   - A bag resting far from any nearby person could still get misclassified `is_carried`
+     from vertical/perspective coincidence alone (no distance gate on the "closest person"
+     heuristic), which is fatal on the very next detection dropout -- a bag believed
+     carried is evicted far more aggressively than a placed one.
+   - Direct frame-by-frame instrumentation against the real ABODA clip (not just visual
+     inspection -- same discipline as the #29 correction) found a genuinely-abandoned bag
+     going undetected by YOLO for 649 consecutive frames (~21.6 seconds), far beyond every
+     existing persistence/eviction threshold in the pipeline.
+   - The actual fix was a real distinguishing signal, not a bigger timeout: a bag believed
+     carried now tracks its own recent position history and gets reclassified "placed" if
+     it hasn't actually displaced over a short window, regardless of what the vertical
+     carried/placed heuristic says that frame. A bag riding with a moving person displaces
+     frame to frame; one resting on the floor does not, no matter how the single-frame
+     geometry happens to read.
+   - That fix's flip side showed up on the second clip: a bag genuinely carried away by its
+     owner, leaving frame with them, was lingering as a false "ABANDONED (PERSISTED)" ghost
+     for a long time under an interim (too-generous) grace window -- fixed by the same
+     motion-stability check, which let the carried-bag grace window shrink back down to a
+     handful of frames instead of staying large "just in case."
+   - Full root-cause/fix narrative: bugs_and_debugs.txt #32-#36.
+
+2. Rewind/skip corrupting bounding boxes and their persistence (bugs_and_debugs.txt #37):
+   the existing seek feature jumped the video position but never reset anything --
+   ByteTrack's own internal motion-prediction state and this project's own tracking
+   bookkeeping both assume continuous frame input, so a manual seek left both silently
+   stale. Fixed by resetting all tracking state, including the underlying ByteTrack
+   instance itself, on every rewind/skip.
+
+3. MCP demo hardening: demo_mcp_query.py crashed with a raw sqlite3 traceback if pointed
+   at a database path that had never been initialized (wrong filename, or a main.py run
+   started without --event-log). It now calls the same idempotent schema-init function the
+   live pipeline uses, so a fresh/mismatched path gives a clear "No runs found" message
+   instead -- the kind of thing worth catching before it happens live in front of someone.
+
+Documented defect count is now 37 entries in bugs_and_debugs.txt (33 BUG, 2 FEATURE,
+2 METHODOLOGY), covered by 66 automated tests -- up from the 31/49 the paper draft was
+last written against. Update paper/IEEE_paper_draft.md's cited numbers before anyone reads
+it; they're stale as of this entry.
 
 Limitations / Future Improvements
 --------------------------------
 - Real-world deployment can be further optimized for higher frame rates on edge hardware.
 - Integrate GPU-accelerated tensor formatting to maximize inference frame rate.
-- Deepen occlusion handling by integrating a visual Re-ID features layer.
+- Deepen occlusion handling by integrating a visual Re-ID features layer. Right now, if you
+  turn around and bend down, the system treats you as a brand new person. Witness protection,
+  but by accident. Concretely available without a new dependency: this project's installed
+  `ultralytics` package already bundles BoT-SORT and Deep OC-SORT tracker backends with an
+  optional `with_reid` appearance-matching mode (auto-downloads a small Re-ID embedding
+  model). Swapping the tracker is not drop-in -- every distance/timing threshold in the
+  engineering layer was calibrated against ByteTrack's specific behavior on real footage and
+  would need re-verification -- but the path is concrete, not speculative, as of 2026-07-22.
+- The same missing Re-ID capability is also why abandoned-bag reconnection is proximity-only,
+  not owner-identity-verified: any nearby person, not just the true owner, currently clears
+  an ABANDONED alert back to ATTENDED. Deliberately not "fixed" with strict ID-matching,
+  because the true owner returning under a churned ID (routine, given the same lack of
+  Re-ID) would then fail to reconnect -- a worse failure than today's behavior. Fixing this
+  properly needs the Re-ID layer above, not a tighter identity check on top of IDs that
+  already aren't stable.
 
 Summary in One Line
 -------------------
-This project is an AI-based CCTV surveillance system that uses YOLOv8, ByteTrack, external JSON configurations, thread-safe memory eviction, and state-machine reasoning to detect anomalies in video streams.
-
+This project is an AI-based CCTV surveillance system that uses YOLOv8, ByteTrack, external JSON configurations, thread-safe memory eviction, and state-machine reasoning to detect anomalies in video streams. Could it BE any more of a summer project.

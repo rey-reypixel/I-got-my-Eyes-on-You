@@ -1,0 +1,116 @@
+Phase 4 Progress Report
+========================
+
+Date: 2026-07-22
+
+Could this phase BE any more of a bag's fault? Nearly every defect this
+session traced back to one physical object refusing to stay detected.
+
+Completed Tasks
+----------------
+- Investigated a real, demo-blocking bug: a bag left on the floor sometimes
+  rendered no bounding box at all after being "left" -- not a warning, not
+  an abandoned alert, just gone. Traced it to a real, reproducible
+  misclassification: the carried-vs-placed heuristic had no distance gate,
+  so a person merely nearest to the bag (even far outside any plausible
+  carrying distance) could still flip it to "carried" from vertical/
+  perspective coincidence alone. Fixed by requiring the reference person to
+  actually be within attending range first (bugs_and_debugs.txt #32).
+- Found a second, distinct failure mode on the same symptom: a bag
+  genuinely being carried, set down, and abandoned mid-drop hit an
+  aggressive zero-grace eviction rule the instant that transition itself
+  caused a missed detection -- which it usually does, since a bag lying
+  flat looks nothing like one riding on a shoulder. Added a short grace
+  window instead of zero tolerance (#33).
+- Instrumented the actual pipeline frame-by-frame against a real clip
+  (ABODA video1.avi) instead of continuing to guess, and found a
+  genuinely-abandoned bag going undetected by YOLO for 649 consecutive
+  frames (~21.6 seconds) -- an order of magnitude past every existing
+  persistence/eviction threshold in the pipeline. Raised the relevant
+  thresholds to match reality (#34, #35), then verified end-to-end against
+  the same real clip a second time to confirm the gap actually closed, not
+  just that the numbers looked bigger.
+- Found the real distinguishing signal instead of leaning on ever-larger
+  timeouts: a bag riding along with a moving person displaces frame to
+  frame; a bag resting on the floor does not, no matter what the vertical
+  carried/placed heuristic says that frame. Added position-history tracking
+  that reclassifies a "carried" bag as placed once it proves itself
+  stationary. This also explained a false-alarm flip side, found on a
+  second real clip (AVSS 2007 AVSSS07_EASY.mpg): a bag genuinely carried
+  away by its owner, leaving frame with them, was lingering as a false
+  "ABANDONED (PERSISTED)" ghost under the interim, too-generous grace
+  window. One fix closed both real-world patterns at once (#36).
+- Fixed an unrelated bug in the video rewind/skip feature: seeking jumped
+  the video position but never reset ByteTrack's own internal tracking
+  state or this project's own bookkeeping, both of which assume continuous
+  frame input. Bounding boxes and their persistence visibly corrupted after
+  any manual seek. Fixed by resetting all tracking state, including the
+  underlying ByteTrack instance itself, on every rewind/skip (#37).
+- Verified the MCP + SQLite event-log demo flow end-to-end against fresh,
+  post-fix data, and hardened demo_mcp_query.py so pointing it at an
+  uninitialized/mismatched database path gives a clear message instead of
+  a raw traceback -- caught by actually rehearsing the demo, not by
+  inspection.
+- Investigated (and explicitly declined to "fix" without discussion) a
+  design question: bag reconnection is proximity-based, not owner-identity-
+  based -- any nearby person, not just the true owner, can currently clear
+  an ABANDONED alert. Confirmed with a targeted repro. Left unfixed on
+  purpose: given ByteTrack has no Re-ID, requiring an exact owner-ID match
+  would make the true owner's own routine ID churn cause the system to fail
+  to recognize its rightful owner returning -- a worse failure than today's
+  behavior. Documented as a real, stated limitation instead of a silent one.
+- Confirmed a concrete (not speculative) upgrade path exists for the
+  underlying Re-ID gap: this project's installed `ultralytics` package
+  already bundles BoT-SORT and Deep OC-SORT tracker backends with an
+  optional appearance-matching mode, no new dependency required. Not
+  implemented this session -- correctly scoped as a separate, bigger
+  follow-up given every threshold in the engineering layer is calibrated
+  against ByteTrack's specific behavior.
+- Wrote please_study.txt: complete study notes covering architecture, the
+  math behind every objective, tools/libraries and why each was chosen,
+  bug themes grouped by root cause, honest advantages/disadvantages, future
+  work, and a defense-prep Q&A section.
+- Brought every piece of project documentation (this file included) back in
+  sync with the current state: bugs_and_debugs.txt, PROJECT_DOCUMENTATION.txt,
+  README.md, the paper draft, and resume.txt all referenced stale defect/
+  test counts (31/49) from before this session; all now read 37/66.
+
+Technical Notes
+-----------------
+- Every fix this session started from a reproduction -- either a targeted
+  synthetic unit-test scenario or an actual instrumented run against real
+  footage -- before any code changed, and every fix was re-verified against
+  the same real footage afterward, not just re-run through the unit test
+  suite. Two of the fixes (#34/#35) were caught as insufficient specifically
+  because of that real-footage re-verification step; a synthetic-test-only
+  workflow would very likely have shipped both as "done" prematurely.
+- Total documented defect-log entries: 37 (33 BUG, 2 FEATURE, 2 METHODOLOGY).
+- Total automated tests: 66, all passing.
+- Real clips used for verification this session: ABODA video1.avi, AVSS 2007
+  AVSSS07_EASY.mpg -- both already present under data/raw from earlier
+  phases, now additionally exercised as regression evidence.
+
+Current Status
+----------------
+- All three detection objectives, the event log, and the MCP query layer
+  have been exercised end-to-end against real footage in a single
+  rehearsed demo flow and produced correct, explainable output.
+- Nothing from this session (or, per `git status`, several sessions before
+  it) has been committed yet. Everything is on disk and correct; none of
+  it has version history. That's the actual next step, not more code.
+
+Next Steps
+------------
+- Commit the accumulated work (see "Current Status" above -- this is
+  overdue, not optional).
+- Decide whether to pursue the Re-ID tracker upgrade (BoT-SORT/Deep
+  OC-SORT) as its own follow-up phase; it is scoped but not started.
+- Investigate the still-open root cause from #34/#35: why yolov8n misses a
+  real, stationary bag for 21+ seconds in the first place. Every fix this
+  session made the system tolerate that gap; none of them explain it.
+- Finish paper submission-readiness: fill in author/affiliation, convert to
+  the IEEEtran LaTeX template, cross-check citations against publisher
+  records, and consider empirically validating the pose-based suspicious-
+  activity signal against real footage (UCF-Crime/Avenue are already
+  available under data/raw) before claiming more than "architecturally
+  complete."
