@@ -24,6 +24,7 @@ except ImportError:  # pragma: no cover - depends on runtime environment
 
 from . import event_log
 from .state_machine import (
+    reset_state,
     tracked_bags,
     tracked_people,
 )
@@ -237,6 +238,35 @@ class MultiModelDetectionEngine:
         if self.pose_model is None:
             self.pose_model = YOLO(self.pose_model_path)
         return self.pose_model
+
+    def _reset_after_seek(self) -> None:
+        """Clear all tracking state after a manual rewind/skip.
+
+        Both `model.track(..., persist=True)` (ByteTrack's own internal Kalman
+        filters and lost/removed-track buffers) and our own tracking layer
+        (tracked_people/tracked_bags/stale_counter/last_known_* etc.) are built
+        on the assumption of continuous, monotonically-increasing frame input.
+        A manual seek breaks that assumption outright: ByteTrack's motion
+        prediction and ID assignment become meaningless once the video jumps
+        discontinuously, and our own bookkeeping (stale_counter, ghost/PERSISTED
+        positions, accumulated WARNING/ABANDONED timers) reflects a temporal
+        position that no longer matches whatever the video jumped to. Without
+        this, bounding boxes and their persistence become visibly incoherent
+        after any rewind/skip -- ghost boxes frozen at positions from the wrong
+        point in time, or IDs and states left over from a future/past segment
+        the video no longer shows. Reported from real use (rewind/forward
+        keys during playback). The only correct-enough fix is a hard reset:
+        start tracking completely fresh from wherever the video lands.
+        """
+        reset_state()
+        if self.model is not None:
+            predictor = getattr(self.model, "predictor", None)
+            trackers = getattr(predictor, "trackers", None) if predictor is not None else None
+            if trackers:
+                for tracker in trackers:
+                    reset_fn = getattr(tracker, "reset", None)
+                    if callable(reset_fn):
+                        reset_fn()
 
     def initialize_stream(self) -> Any:
         if cv2 is None:
@@ -509,10 +539,19 @@ class MultiModelDetectionEngine:
                 2,
             )
 
-        # Persist visual rendering for all tracked bags during YOLO detection dropouts
+        # Persist visual rendering for all tracked bags during YOLO detection dropouts.
+        # The cutoff (config bag_persist_frames, default 900 / 30s at 30fps) is set from
+        # a real observed gap, not a guess: tracing a genuinely left-behind bag through
+        # ABODA video1.avi frame-by-frame found YOLO detecting zero backpack-class objects
+        # at all for 649 consecutive frames (~21.6s) before reacquiring it -- far beyond the
+        # previous hardcoded 150-frame (5s) cutoff, which let the box go dark for most of
+        # that real gap despite the bag never having actually moved. Matches
+        # state_max_stale_frames (also raised to 900) so the box keeps rendering for the
+        # entry's entire in-memory lifetime rather than going dark before eviction.
+        bag_persist_frames = self.state_machine_config.get("bag_persist_frames", 900)
         for bag_id, bag_info in tracked_bags.items():
             if bag_id not in drawn_bag_ids:
-                if bag_info.get("stale_counter", 0) < 150:  # Only persist for 5 seconds of dropouts (150 frames at 30fps)
+                if bag_info.get("stale_counter", 0) < bag_persist_frames:
                     bx, by = bag_info["center_coords"]
                     bw = bag_info.get("width", 40.0)
                     bh = bag_info.get("height", 40.0)
@@ -577,6 +616,7 @@ class MultiModelDetectionEngine:
                                 target_frame = max(0.0, current_frame - (10.0 * fps) - 1.0)
                                 self.capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                                 frame_count = int(target_frame)
+                                self._reset_after_seek()
                                 key = ord("p")  # Keep paused after updating frame
                                 break
                             elif resume_key in (ord("f"), 83, ord("]")):
@@ -589,6 +629,7 @@ class MultiModelDetectionEngine:
                                 target_frame = min(total_frames, current_frame + (10.0 * fps) - 1.0)
                                 self.capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                                 frame_count = int(target_frame)
+                                self._reset_after_seek()
                                 key = ord("p")  # Keep paused after updating frame
                                 break
                             elif resume_key == ord("p") or resume_key == 32:
@@ -607,6 +648,7 @@ class MultiModelDetectionEngine:
                         target_frame = max(0.0, current_frame - (10.0 * fps) - 1.0)
                         self.capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                         frame_count = int(target_frame)
+                        self._reset_after_seek()
                     elif key in (ord("f"), 83, ord("]")):
                         # Skip 10 seconds during active playback
                         fps = self.capture.get(cv2.CAP_PROP_FPS)
@@ -617,6 +659,7 @@ class MultiModelDetectionEngine:
                         target_frame = min(total_frames, current_frame + (10.0 * fps) - 1.0)
                         self.capture.set(cv2.CAP_PROP_POS_FRAMES, target_frame)
                         frame_count = int(target_frame)
+                        self._reset_after_seek()
         finally:
             if self.event_log_path and self._event_run_id is not None:
                 event_log.end_run(self.event_log_path, self._event_run_id)

@@ -229,10 +229,13 @@ def update_tracking_states(
     panic_threshold_devs = state_machine_config.get("panic_threshold_devs", 3.0)
     bag_disconnect_dist = state_machine_config.get("bag_disconnect_dist", 50.0)
     bag_reconnect_dist = state_machine_config.get("bag_reconnect_dist", 30.0)
-    state_max_stale_frames = state_machine_config.get("state_max_stale_frames", 300)
+    state_max_stale_frames = state_machine_config.get("state_max_stale_frames", 900)
     kinematic_velocity_threshold = state_machine_config.get("kinematic_velocity_threshold", 0.05)
     min_velocity_history_frames = state_machine_config.get("min_velocity_history_frames", 5)
     panic_recovery_frames = state_machine_config.get("panic_recovery_frames", 30)
+    bag_carried_dropout_grace_frames = state_machine_config.get("bag_carried_dropout_grace_frames", 5)
+    bag_stationary_window = state_machine_config.get("bag_stationary_window", 6)
+    bag_stationary_px = state_machine_config.get("bag_stationary_px", 10.0)
 
     detections = []
     for result in yolo_results:
@@ -505,14 +508,50 @@ def update_tracking_states(
             bw = bag_data["width"]
             bh = bag_data["height"]
             
-            # Check if carried: vertical distance to centroid vs feet
+            # Check if carried: vertical distance to centroid vs feet -- but only
+            # for a person actually within attending range of the bag. Without this
+            # gate, whichever person is globally nearest (even someone far across
+            # the frame, well outside any plausible carrying distance) still gets
+            # run through the vertical check, and incidental perspective alignment
+            # (a bag placed farther back can sit level with a nearby person's torso
+            # rather than their feet) can flip is_carried to True for a bag nobody
+            # is touching. That misfire is fatal down the line: a dropout on a
+            # bag believed "carried" is evicted outright with no persisted box
+            # (see bugs_and_debugs.txt #29's follow-up note on this exact suspicion).
             is_carried = False
             if closest_person is not None:
-                dy_centroid = abs(py_closest - by)
-                dy_feet = abs((py_closest + person_height / 2.0) - by)
-                if dy_centroid <= dy_feet:
-                    is_carried = True
-                    
+                max_carry_dist = max(bag_disconnect_dist, person_height * 0.45)
+                if closest_dist <= max_carry_dist:
+                    dy_centroid = abs(py_closest - by)
+                    dy_feet = abs((py_closest + person_height / 2.0) - by)
+                    if dy_centroid <= dy_feet:
+                        is_carried = True
+
+            # Motion-stability override: a bag riding along with a moving person
+            # displaces frame to frame; a bag resting on the floor, even one a
+            # person is standing right next to (passing the proximity gate above),
+            # does not. Reported from real footage (AVSS 2007 AVSSS07_EASY.mpg):
+            # without this, a bag that's actually just sitting there near someone
+            # can stay misclassified "carried" purely from vertical/perspective
+            # coincidence, which is fatal down the line -- a "carried" bag's
+            # dropout is treated with much less patience than a placed one's (see
+            # bugs_and_debugs.txt #33/#35). Track recent active-detection positions
+            # and require net displacement over that window to exceed a small
+            # threshold before believing "carried" at all; a bag that hasn't
+            # actually gone anywhere overrides straight to "placed" regardless of
+            # what the vertical heuristic said this frame.
+            position_history = (
+                tracked_bags[bag_id].setdefault("position_history", deque(maxlen=bag_stationary_window))
+                if bag_id in tracked_bags
+                else deque(maxlen=bag_stationary_window)
+            )
+            position_history.append((bx, by))
+            if is_carried and len(position_history) >= bag_stationary_window:
+                oldest_x, oldest_y = position_history[0]
+                net_displacement = math.hypot(bx - oldest_x, by - oldest_y)
+                if net_displacement <= bag_stationary_px:
+                    is_carried = False
+
             if bag_id not in tracked_bags:
                 # Recover accumulated state (state/timer) from a recently-vanished
                 # bag at (nearly) the same position instead of resetting to
@@ -542,6 +581,8 @@ def update_tracking_states(
                         "timer": recovered["timer"],
                         "stale_counter": 0,
                         "is_carried": is_carried,
+                        "carried_miss_streak": 0,
+                        "position_history": position_history,
                     }
                 else:
                     tracked_bags[bag_id] = {
@@ -553,36 +594,81 @@ def update_tracking_states(
                         "timer": 0,
                         "stale_counter": 0,
                         "is_carried": is_carried,
+                        "carried_miss_streak": 0,
+                        "position_history": position_history,
                     }
             else:
                 tracked_bags[bag_id]["center_coords"] = (bx, by)
                 tracked_bags[bag_id]["width"] = bw
                 tracked_bags[bag_id]["height"] = bh
                 tracked_bags[bag_id]["is_carried"] = is_carried
+                tracked_bags[bag_id]["carried_miss_streak"] = 0
                 if closest_person_id is not None:
                     tracked_bags[bag_id]["owner_id"] = closest_person_id
         else:
             # Missing bag (dropout)
             if tracked_bags[bag_id].get("is_carried", False):
-                # Evict carried bags immediately on dropout to prevent ghost bounding boxes
-                # and false alarms (a stale, frozen ghost position could otherwise fall
-                # behind a bag that's still actually with its owner, just briefly
-                # undetected, and wrongly accumulate towards WARNING/ABANDONED).
-                # Stash a short-lived echo of its accumulated state first, so that if
-                # the same physical bag is reacquired nearby moments later (very likely,
-                # since bags are stationary -- see bugs_and_debugs.txt #29), it doesn't
-                # have to start over from ATTENDED/timer=0.
-                evicted = tracked_bags.pop(bag_id)
-                with recently_evicted_bags_lock:
-                    recently_evicted_bags[bag_id] = {
-                        "center_coords": evicted["center_coords"],
-                        "state": evicted["state"],
-                        "timer": evicted["timer"],
-                        "owner_id": evicted.get("owner_id"),
-                        "ttl": 30,
-                    }
-                continue
-            
+                # A bag believed carried gets a short grace window (config
+                # bag_carried_dropout_grace_frames, default 5) before eviction,
+                # instead of zero tolerance. This exists because the carried ->
+                # placed transition itself routinely causes a missed detection: a
+                # bag lying flat looks nothing like one riding on a shoulder, and the
+                # drop motion tends to blur the frame(s) it happens on. Zero grace
+                # meant that ordinary transition miss deleted a just-set-down bag
+                # outright, with no persisted box ever shown -- it wasn't abandoned
+                # quietly, it was un-rendered quietly (bugs_and_debugs.txt #32, #33).
+                #
+                # This window was briefly raised all the way to 900 (#34/#35) to
+                # bridge a real ~649-frame (~21.6s) YOLO dropout found on ABODA
+                # video1.avi -- but that bag was actually stationary/placed the
+                # whole time, just misclassified "carried" by vertical/perspective
+                # coincidence. The motion-stability check above (bag_stationary_window
+                # / bag_stationary_px) now catches that misclassification directly,
+                # so a genuinely-stationary bag is routed through the *placed* path
+                # (state_max_stale_frames / bag_persist_frames, still 900) instead of
+                # this one. That freed this grace window to go back to being short:
+                # a bag that really is still being carried, moving with a live
+                # person, needs only a couple of frames to bridge an ordinary
+                # detection blip -- it does not need hundreds. process_abandoned_logic
+                # still runs below using the frozen position every grace frame, so a
+                # genuinely-departing owner keeps accumulating WARNING time regardless
+                # of whether detection has resumed, and once the grace budget is
+                # exhausted this still falls back to the original instant eviction.
+                #
+                # Reported from real footage (AVSS 2007 AVSSS07_EASY.mpg): a person
+                # who genuinely carried a bag out of frame with them left behind a
+                # long-lived, false "ABANDONED (PERSISTED)" ghost box under the old
+                # 900-frame grace -- exactly the #20/#29 ghost-duplicate risk that
+                # window's size had reopened, now observed directly rather than just
+                # predicted. Shrinking the grace back down plus the stability check
+                # above fixes both real-world patterns at once: a truly-placed bag
+                # (ABODA) gets the long window via the *right* path, and a truly-
+                # carried bag that leaves with its owner (AVSS) is no longer kept
+                # alive as a stale ghost for minutes after it's actually gone.
+                miss_streak = tracked_bags[bag_id].get("carried_miss_streak", 0) + 1
+                tracked_bags[bag_id]["carried_miss_streak"] = miss_streak
+                if miss_streak > bag_carried_dropout_grace_frames:
+                    # Grace exhausted: evict to prevent ghost bounding boxes and false
+                    # alarms (a stale, frozen ghost position could otherwise fall behind
+                    # a bag that's still actually with its owner, just undetected, and
+                    # wrongly accumulate towards WARNING/ABANDONED). Stash a short-lived
+                    # echo of its accumulated state first, so that if the same physical
+                    # bag is reacquired nearby moments later (very likely, since bags are
+                    # stationary -- see bugs_and_debugs.txt #29), it doesn't have to start
+                    # over from ATTENDED/timer=0.
+                    evicted = tracked_bags.pop(bag_id)
+                    with recently_evicted_bags_lock:
+                        recently_evicted_bags[bag_id] = {
+                            "center_coords": evicted["center_coords"],
+                            "state": evicted["state"],
+                            "timer": evicted["timer"],
+                            "owner_id": evicted.get("owner_id"),
+                            "ttl": 30,
+                        }
+                    continue
+                # Still within the grace window: fall through and hold the last-known
+                # position/state, same as a non-carried bag's dropout below.
+
             bx, by = tracked_bags[bag_id]["center_coords"]
             bw = tracked_bags[bag_id].get("width", 40.0)
             bh = tracked_bags[bag_id].get("height", 40.0)
