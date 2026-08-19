@@ -80,3 +80,15 @@ python mcp_server/server.py --db-path demo_events.db
 Note: the MCP tool layer is real and spec-compliant, but no LLM is actually wired into this
 project — `demo_mcp_query.py` calls the tools with hardcoded Python to prove the data path
 works, not to demonstrate an LLM reasoning about which tool to call.
+
+---
+
+## License
+
+[Business Source License 1.1](LICENSE) — source-available, **not** open source.
+
+Free for non-production use: personal projects, evaluation, research, and teaching.
+**Any production or commercial use requires a paid commercial license.**
+On **2030-08-19** this version converts automatically to Apache License 2.0.
+
+Commercial and production licensing: **mahashreyaa@gmail.com**
