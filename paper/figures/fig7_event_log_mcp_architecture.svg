@@ -1,0 +1,48 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 400" font-family="Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#222"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="900" height="400" fill="#ffffff"/>
+
+  <!-- Left process -->
+  <rect x="30" y="120" width="220" height="90" rx="8" fill="#eef1fb" stroke="#2c3e6b" stroke-width="1.8"/>
+  <text x="140" y="155" text-anchor="middle" font-size="14" fill="#111" font-weight="bold">Live Video Pipeline</text>
+  <text x="140" y="172" text-anchor="middle" font-size="12" fill="#333">(main.py)</text>
+  <text x="140" y="192" text-anchor="middle" font-size="10.5" fill="#555" font-style="italic">blocking OpenCV frame loop</text>
+
+  <!-- SQLite cylinder -->
+  <ellipse cx="450" cy="130" rx="70" ry="16" fill="#f5f5f7" stroke="#222" stroke-width="1.6"/>
+  <path d="M 380,130 L 380,210 A 70,16 0 0 0 520,210 L 520,130" fill="#f5f5f7" stroke="#222" stroke-width="1.6"/>
+  <ellipse cx="450" cy="210" rx="70" ry="16" fill="none" stroke="#222" stroke-width="1.6"/>
+  <text x="450" y="175" text-anchor="middle" font-size="13" fill="#111" font-weight="bold">SQLite</text>
+  <text x="450" y="192" text-anchor="middle" font-size="11" fill="#333">(event log)</text>
+
+  <!-- Right process -->
+  <rect x="650" y="120" width="220" height="90" rx="8" fill="#eef1fb" stroke="#2c3e6b" stroke-width="1.8"/>
+  <text x="760" y="155" text-anchor="middle" font-size="14" fill="#111" font-weight="bold">MCP Server</text>
+  <text x="760" y="175" text-anchor="middle" font-size="10.5" fill="#555" font-style="italic">separate process, async</text>
+  <text x="760" y="192" text-anchor="middle" font-size="10.5" fill="#555" font-style="italic">reads only &#8226; Sec. III-G</text>
+
+  <!-- Arrows: NO direct arrow between the two boxes -->
+  <line x1="250" y1="150" x2="376" y2="150" stroke="#222" stroke-width="1.7" marker-end="url(#arrow)"/>
+  <text x="313" y="140" text-anchor="middle" font-size="10.5" fill="#111">write-only</text>
+
+  <line x1="650" y1="150" x2="524" y2="150" stroke="#222" stroke-width="1.7" marker-end="url(#arrow)"/>
+  <text x="587" y="140" text-anchor="middle" font-size="10.5" fill="#111">read-only</text>
+
+  <text x="140" y="245" text-anchor="middle" font-size="11" fill="#555">state-change events only,</text>
+  <text x="140" y="260" text-anchor="middle" font-size="11" fill="#555">fire-and-forget</text>
+
+  <text x="760" y="245" text-anchor="middle" font-size="10.5" fill="#555">list_runs &#8226; list_alerts</text>
+  <text x="760" y="260" text-anchor="middle" font-size="10.5" fill="#555">get_track_history</text>
+  <text x="760" y="275" text-anchor="middle" font-size="10.5" fill="#555">get_run_summary</text>
+
+  <!-- Big X between the two boxes to emphasize no direct connection -->
+  <line x1="230" y1="300" x2="670" y2="300" stroke="#999" stroke-width="1.2" stroke-dasharray="2,6"/>
+  <text x="450" y="320" text-anchor="middle" font-size="12" fill="#666" font-style="italic">no shared process or thread &#8212; neither can block or crash the other</text>
+
+  <text x="20" y="368" font-size="12" fill="#111">Fig. 7. Event log and MCP server architecture. The two processes communicate only through a shared</text>
+  <text x="20" y="384" font-size="12" fill="#111">SQLite file; the MCP server never observes the live video loop directly (Section III-G).</text>
+</svg>

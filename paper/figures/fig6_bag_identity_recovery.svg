@@ -1,0 +1,93 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1080 660" font-family="Arial, Helvetica, sans-serif">
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#222"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="1080" height="660" fill="#ffffff"/>
+
+  <!-- ===== LEFT FLOW: new track ID ===== -->
+  <text x="40" y="30" font-size="13" fill="#2c3e6b" font-weight="bold">New-ID recovery</text>
+
+  <rect x="40" y="44" width="230" height="50" rx="6" fill="#eef1fb" stroke="#2c3e6b" stroke-width="1.6"/>
+  <text x="155" y="74" text-anchor="middle" font-size="12" fill="#111">New bag track ID detected</text>
+
+  <line x1="155" y1="94" x2="155" y2="122" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <polygon points="155,122 260,172 155,222 50,172" fill="#fff3e0" stroke="#a66a00" stroke-width="1.8"/>
+  <text x="155" y="164" text-anchor="middle" font-size="10" fill="#7a4d00">vanished bag</text>
+  <text x="155" y="178" text-anchor="middle" font-size="10" fill="#7a4d00">within small radius</text>
+  <text x="155" y="192" text-anchor="middle" font-size="10" fill="#7a4d00">(tracked or recovery buf)?</text>
+
+  <line x1="260" y1="172" x2="330" y2="172" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="292" y="162" text-anchor="middle" font-size="11" fill="#1c4a35" font-weight="bold">YES</text>
+
+  <rect x="332" y="140" width="230" height="64" rx="6" fill="#eaf3ee" stroke="#2e7d5b" stroke-width="1.7"/>
+  <text x="447" y="164" text-anchor="middle" font-size="11.5" fill="#111">Recover state / timer /</text>
+  <text x="447" y="180" text-anchor="middle" font-size="11.5" fill="#111">owner_id onto new ID</text>
+  <text x="447" y="196" text-anchor="middle" font-size="10" fill="#555" font-style="italic">Sec. IV-D</text>
+
+  <line x1="155" y1="222" x2="155" y2="252" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="175" y="240" font-size="11" fill="#7a1a15" font-weight="bold">NO</text>
+
+  <rect x="40" y="254" width="230" height="54" rx="6" fill="#ffffff" stroke="#222" stroke-width="1.5"/>
+  <text x="155" y="277" text-anchor="middle" font-size="11.5" fill="#111">Initialize fresh:</text>
+  <text x="155" y="293" text-anchor="middle" font-size="11.5" fill="#111">state = ATTENDED, timer = 0</text>
+
+  <!-- ===== RIGHT FLOW: dropout ===== -->
+  <text x="640" y="30" font-size="13" fill="#6b3fa0" font-weight="bold">Dropout classification (most-revised logic, Sec. IV-D)</text>
+
+  <rect x="640" y="44" width="230" height="50" rx="6" fill="#f6effa" stroke="#6b3fa0" stroke-width="1.6"/>
+  <text x="755" y="74" text-anchor="middle" font-size="12" fill="#111">Bag goes missing (dropout)</text>
+
+  <line x1="755" y1="94" x2="755" y2="122" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <polygon points="755,122 830,160 755,198 680,160" fill="#fff3e0" stroke="#a66a00" stroke-width="1.8"/>
+  <text x="755" y="164" text-anchor="middle" font-size="11" fill="#7a4d00">is_carried?</text>
+
+  <line x1="830" y1="160" x2="920" y2="160" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="875" y="150" text-anchor="middle" font-size="11" fill="#7a1a15" font-weight="bold">NO</text>
+  <rect x="922" y="132" width="140" height="56" rx="6" fill="#ffffff" stroke="#222" stroke-width="1.4"/>
+  <text x="992" y="153" text-anchor="middle" font-size="10" fill="#111">Normal placed-bag</text>
+  <text x="992" y="167" text-anchor="middle" font-size="10" fill="#111">handling (unchanged)</text>
+
+  <line x1="755" y1="198" x2="755" y2="228" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="775" y="216" font-size="11" fill="#1c4a35" font-weight="bold">YES</text>
+
+  <polygon points="755,228 860,272 755,316 650,272" fill="#fff3e0" stroke="#a66a00" stroke-width="1.8"/>
+  <text x="755" y="264" text-anchor="middle" font-size="10" fill="#7a4d00">displacement over</text>
+  <text x="755" y="278" text-anchor="middle" font-size="10" fill="#7a4d00">recent window &gt;</text>
+  <text x="755" y="292" text-anchor="middle" font-size="10" fill="#7a4d00">stationary threshold?</text>
+
+  <line x1="860" y1="272" x2="930" y2="272" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="895" y="262" text-anchor="middle" font-size="11" fill="#1c4a35" font-weight="bold">YES</text>
+  <text x="895" y="285" text-anchor="middle" font-size="9.5" fill="#555" font-style="italic">(genuinely moving</text>
+  <text x="895" y="298" text-anchor="middle" font-size="9.5" fill="#555" font-style="italic">with someone)</text>
+
+  <rect x="640" y="330" width="230" height="66" rx="6" fill="#fbe9e7" stroke="#b3261e" stroke-width="1.6"/>
+  <text x="755" y="352" text-anchor="middle" font-size="11" fill="#111">Short grace window &#8594;</text>
+  <text x="755" y="367" text-anchor="middle" font-size="11" fill="#111">evict to recovery buffer</text>
+  <text x="755" y="382" text-anchor="middle" font-size="11" fill="#111">if still missing</text>
+
+  <line x1="930" y1="272" x2="930" y2="330" stroke="#222" stroke-width="1.5"/>
+  <line x1="930" y1="330" x2="870" y2="363" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <line x1="650" y1="272" x2="580" y2="272" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+  <text x="615" y="262" text-anchor="middle" font-size="11" fill="#7a1a15" font-weight="bold">NO</text>
+  <text x="580" y="285" text-anchor="middle" font-size="9.5" fill="#555" font-style="italic">(actually stationary,</text>
+  <text x="580" y="298" text-anchor="middle" font-size="9.5" fill="#555" font-style="italic">reclassify placed)</text>
+
+  <rect x="380" y="330" width="230" height="66" rx="6" fill="#eaf3ee" stroke="#2e7d5b" stroke-width="1.6"/>
+  <text x="495" y="352" text-anchor="middle" font-size="11" fill="#111">Long persistence window,</text>
+  <text x="495" y="367" text-anchor="middle" font-size="11" fill="#111">no eviction on dropout</text>
+  <text x="495" y="382" text-anchor="middle" font-size="11" fill="#111">alone</text>
+
+  <line x1="580" y1="272" x2="495" y2="330" stroke="#222" stroke-width="1.5" marker-end="url(#arrow)"/>
+
+  <rect x="40" y="440" width="1000" height="60" rx="6" fill="#f4f4f7" stroke="#666" stroke-width="1.2" stroke-dasharray="4,3"/>
+  <text x="60" y="463" font-size="11.5" fill="#333">The dropout-classification branch (right) is this project's most-revised piece of logic (Section IV-D's finding</text>
+  <text x="60" y="480" font-size="11.5" fill="#333">and resolution both center on it) &#8212; a physically moving bag displaces frame to frame, a placed one does not.</text>
+
+  <text x="20" y="540" font-size="12" fill="#111">Fig. 6. Identity-fragmentation-aware bag state recovery. A new track ID within a small radius of a</text>
+  <text x="20" y="556" font-size="12" fill="#111">recently-vanished bag inherits its accumulated state rather than resetting it (Section III-F).</text>
+</svg>
