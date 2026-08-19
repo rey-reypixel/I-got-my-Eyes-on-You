@@ -46,6 +46,80 @@ class ConfigTests(unittest.TestCase):
             expected_polygon = [(48.0, 48.0), (272.0, 272.0)]
             self.assertEqual(engine.roi_polygon, expected_polygon)
 
+    def test_roi_disabled_ignores_configured_polygon(self):
+        # Regression for the removed AVSS-filename-sniffing hack: whether the
+        # ROI polygon applies is now an explicit config choice
+        # (detection.roi_enabled), not inferred from the source video's
+        # filename. roi_enabled=false must disable it even though a polygon
+        # is present in config, regardless of what self.source is.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "test_config.json"
+            config_content = {
+                "roi_polygon": [[0.0, 0.0], [0.22, 0.0], [0.12, 1.0], [0.0, 1.0]],
+                "detection": {"confidence": 0.35, "imgsz": 640, "roi_enabled": False},
+            }
+            with config_path.open("w", encoding="utf-8") as f:
+                json.dump(config_content, f)
+
+            engine = MultiModelDetectionEngine(
+                source="some_unrelated_video.mp4",
+                model_path="dummy.pt",
+                config_path=str(config_path),
+            )
+            self.assertEqual(engine.roi_polygon, [])
+
+    def test_roi_enabled_applies_regardless_of_filename(self):
+        # The flip side: roi_enabled=true (or omitted, since it defaults to
+        # True) must apply the configured polygon no matter what the source
+        # filename is -- there is no more dataset-name string matching.
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "test_config.json"
+            config_content = {
+                "roi_polygon": [[0.0, 0.0], [0.22, 0.0], [0.12, 1.0], [0.0, 1.0]],
+                "detection": {"confidence": 0.35, "imgsz": 640, "roi_enabled": True},
+            }
+            with config_path.open("w", encoding="utf-8") as f:
+                json.dump(config_content, f)
+
+            engine = MultiModelDetectionEngine(
+                source="totally_unrelated_footage.mp4",
+                model_path="dummy.pt",
+                config_path=str(config_path),
+            )
+            self.assertEqual(len(engine.roi_polygon), 4)
+
+    def test_explicit_device_overrides_config(self):
+        # Previously config.json's detection.device always won, even when a
+        # caller explicitly requested a different device (e.g. --device cuda
+        # on the CLI was silently reverted to config's "cpu").
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "test_config.json"
+            config_content = {"detection": {"device": "cpu"}}
+            with config_path.open("w", encoding="utf-8") as f:
+                json.dump(config_content, f)
+
+            engine = MultiModelDetectionEngine(
+                source="dummy.mp4",
+                model_path="dummy.pt",
+                device="cuda",
+                config_path=str(config_path),
+            )
+            self.assertEqual(engine.device, "cuda")
+
+    def test_device_falls_back_to_config_when_not_explicit(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "test_config.json"
+            config_content = {"detection": {"device": "cuda:0"}}
+            with config_path.open("w", encoding="utf-8") as f:
+                json.dump(config_content, f)
+
+            engine = MultiModelDetectionEngine(
+                source="dummy.mp4",
+                model_path="dummy.pt",
+                config_path=str(config_path),
+            )
+            self.assertEqual(engine.device, "cuda:0")
+
     def test_missing_config_falls_back_to_defaults(self):
         engine = MultiModelDetectionEngine(
             source="dummy.mp4",

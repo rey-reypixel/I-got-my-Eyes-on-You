@@ -1,0 +1,38 @@
+# BoT-SORT tracker config with appearance-based Re-ID enabled.
+#
+# This is the single highest-leverage fix identified in bugs_and_debugs.txt /
+# please_study.txt: the default ByteTrack association (motion + IoU only, no
+# appearance model) was traced as the root cause behind the majority of the
+# project's 37 logged defects -- a stationary bag or person briefly occluded,
+# or whose detection confidence dips for one frame, gets silently reassigned a
+# new track identity, which resets any accumulated dwell-time/state (abandoned-
+# object timers, ghost-box persistence, etc.).
+#
+# Values below are copied from ultralytics' own botsort.yaml defaults
+# (https://github.com/ultralytics/ultralytics/blob/main/ultralytics/cfg/trackers/botsort.yaml)
+# as of ultralytics 8.4.123, with only with_reid flipped on. PLACEHOLDER STATUS:
+# untested against real footage in this checkout (no GPU available here) --
+# every distance/timing threshold in config.json's state_machine block was
+# calibrated against plain ByteTrack's behavior and WILL need real-footage
+# re-verification after switching to this tracker (see Phase 1 of the project
+# plan). Point main.py/benchmark scripts at this file via --tracker or
+# detection.tracker in config.json once on GPU hardware, then re-run the
+# VIRAT id-switch evaluation (benchmark/evaluate_against_ground_truth.py) to
+# quantify the actual improvement before trusting it in the paper.
+
+tracker_type: botsort
+track_high_thresh: 0.25
+track_low_thresh: 0.1
+new_track_thresh: 0.25
+track_buffer: 30
+match_thresh: 0.8
+fuse_score: True
+
+# BoT-SORT specifics
+gmc_method: sparseOptFlow
+
+# ReID model related thresh
+proximity_thresh: 0.5
+appearance_thresh: 0.8
+with_reid: True
+model: auto

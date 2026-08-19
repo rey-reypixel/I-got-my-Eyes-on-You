@@ -1,5 +1,20 @@
-ultralytics>=8.2.0
+# Core pipeline
+ultralytics>=8.4.0    # 8.4.0+ required for the YOLO26 model family (yolo26n.pt / yolo26n-pose.pt);
+                      # confirmed latest as of 2026-08-19 is 8.4.123 -- re-check before pinning further
 opencv-python>=4.9.0
+mcp>=1.28.0           # NOTE: mcp 2.0.0 has since been released (major version bump). Not adopted here
+                      # yet -- mcp_server/server.py has not been verified against its API, evaluate
+                      # separately before bumping this floor.
+
+# PyTorch: install a CUDA-matched build separately BEFORE `pip install -r requirements.txt`, since a
+# plain `torch`/`torchvision` install here resolves to a CPU-only (or platform-default) wheel, not a
+# CUDA build. On the GPU machine, run (check https://pytorch.org/get-started/locally/ for the CUDA
+# version matching your installed CUDA toolkit -- do not assume cu121/cu124 is still current):
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/<cuXXX>
+# then verify with: python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
 torch>=2.2.0
 torchvision>=0.17.0
-mcp>=1.28.0
+
+# Evaluation / benchmarking (Phase 2-3 ground-truth evaluators)
+scipy>=1.11.0         # .mat ground-truth loading (benchmark/avenue_auc_eval.py)
+scikit-learn>=1.3.0   # roc_auc_score for frame-level AUC-ROC (benchmark/avenue_auc_eval.py)

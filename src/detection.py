@@ -153,7 +153,7 @@ class MultiModelDetectionEngine:
         source: Optional[str] = None,
         model_path: Optional[str] = None,
         pose_model_path: Optional[str] = None,
-        device: str = "cpu",
+        device: Optional[str] = None,
         confidence: float = 0.25,
         imgsz: int = 640,
         config_path: Optional[str] = None,
@@ -185,7 +185,14 @@ class MultiModelDetectionEngine:
         # Override from config if available
         self.confidence = self.config_data.get("detection", {}).get("confidence", self.confidence)
         self.imgsz = self.config_data.get("detection", {}).get("imgsz", self.imgsz)
-        self.device = self.config_data.get("detection", {}).get("device", self.device)
+        # device precedence: an explicit constructor/CLI value wins; otherwise
+        # fall back to config.json; otherwise default to "cpu". Previously the
+        # config value always won even when a caller explicitly asked for a
+        # different device (e.g. `python main.py --device cuda` was silently
+        # reverted to config.json's "cpu"), which is exactly backwards.
+        self.device = device or self.config_data.get("detection", {}).get("device", "cpu")
+        self.half = self.config_data.get("detection", {}).get("half", False)
+        self.tracker = self.config_data.get("detection", {}).get("tracker", "bytetrack.yaml")
         self.state_machine_config = self.config_data.get("state_machine", {})
         # Inject imgsz for normalized coordinate calculations
         self.state_machine_config["imgsz"] = self.imgsz
@@ -195,16 +202,17 @@ class MultiModelDetectionEngine:
         self.capture: Optional[Any] = None
 
         raw_polygon = self.config_data.get("roi_polygon")
-        
-        # If the polygon matches the hardcoded AVSS train tracks safety boundary,
-        # we only apply it if the video source path is indeed an AVSS video.
-        if raw_polygon == [[0.0, 0.0], [0.22, 0.0], [0.12, 1.0], [0.0, 1.0]]:
-            source_str = str(self.source).upper()
-            if "AVSS" not in source_str:
-                self.roi_polygon = []
-                return
+        # A restricted-zone polygon is scene-specific: it only makes sense for
+        # the camera view it was drawn against. Whether it's applied is an
+        # explicit config choice (detection.roi_enabled, default True) rather
+        # than inferred by sniffing the source video's filename for a dataset
+        # name -- that produced false intrusions on any video that happened to
+        # reuse the same polygon shape under a different filename.
+        self.roi_enabled = self.config_data.get("detection", {}).get("roi_enabled", True)
 
-        if raw_polygon:
+        if not self.roi_enabled:
+            self.roi_polygon = []
+        elif raw_polygon:
             self.roi_polygon = []
             for pt in raw_polygon:
                 px, py = pt
@@ -290,10 +298,11 @@ class MultiModelDetectionEngine:
         return model.track(
             frame,
             persist=True,
-            tracker="bytetrack.yaml",
+            tracker=self.tracker,
             conf=self.confidence,
             imgsz=self.imgsz,
             device=self.device,
+            half=self.half,
             classes=[0, 24, 26, 28],
             verbose=False,
         )
@@ -309,6 +318,7 @@ class MultiModelDetectionEngine:
             conf=self.confidence,
             imgsz=self.imgsz,
             device=self.device,
+            half=self.half,
             classes=[0],
             verbose=False,
         )

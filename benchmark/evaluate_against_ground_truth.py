@@ -65,12 +65,26 @@ def iou_xyxy(a: Tuple[float, float, float, float], b: Tuple[float, float, float,
 
 
 def run_detection_pass(
-    video_path: Path, start_frame: int, end_frame: int, confidence: float, imgsz: int = 640
+    video_path: Path,
+    start_frame: int,
+    end_frame: int,
+    confidence: float,
+    imgsz: int = 640,
+    model_path: str = "yolov8n.pt",
+    device: str = "cpu",
+    tracker: str = "bytetrack.yaml",
+    half: bool = False,
 ) -> Dict[int, List[Tuple[int, float, float, float, float]]]:
     """Returns {frame_index: [(track_id, x1, y1, x2, y2), ...]} in ORIGINAL video
     coordinate space (the letterbox transform is inverted so boxes are directly
     comparable to the ground truth, which is defined in original-frame pixels).
     frame_index is the video's absolute frame number, matching load_ground_truth.
+
+    model_path/device/tracker/half were previously hardcoded to the CPU baseline
+    stack (yolov8n.pt, "cpu", bytetrack.yaml) independent of everything else in
+    the pipeline -- exposed as parameters so this evaluator can be pointed at a
+    different detector, tracker, or device (e.g. a GPU run, or the Re-ID-capable
+    tracker config under configs/trackers/) without editing this file.
     """
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -83,7 +97,7 @@ def run_detection_pass(
     pad_x = (imgsz - src_w * scale) / 2.0
     pad_y = (imgsz - src_h * scale) / 2.0
 
-    model = YOLO("yolov8n.pt")
+    model = YOLO(model_path)
     detections_by_frame: Dict[int, List[Tuple[int, float, float, float, float]]] = {}
 
     frame_idx = start_frame
@@ -94,8 +108,9 @@ def run_detection_pass(
 
         frame_resized = letterbox_resize(frame, imgsz)
         results = model.track(
-            frame_resized, persist=True, tracker="bytetrack.yaml",
-            conf=confidence, imgsz=imgsz, device="cpu", classes=[0, 24, 26, 28], verbose=False,
+            frame_resized, persist=True, tracker=tracker,
+            conf=confidence, imgsz=imgsz, device=device, half=half,
+            classes=[0, 24, 26, 28], verbose=False,
         )
 
         boxes_this_frame = []
@@ -195,6 +210,12 @@ def main() -> None:
     parser.add_argument("--start-frame", type=int, default=0)
     parser.add_argument("--max-frames", type=int, default=300, help="Number of frames to evaluate, starting at --start-frame")
     parser.add_argument("--iou-threshold", type=float, default=0.5)
+    parser.add_argument("--model-path", type=str, default="yolov8n.pt",
+                         help="Detector weights, e.g. yolov8n.pt (CPU baseline) or yolo26n.pt (GPU stack)")
+    parser.add_argument("--device", type=str, default="cpu", help='"cpu", "cuda", or "cuda:0"')
+    parser.add_argument("--tracker", type=str, default="bytetrack.yaml",
+                         help="Tracker config, e.g. bytetrack.yaml or configs/trackers/botsort_reid.yaml")
+    parser.add_argument("--half", action="store_true", help="Run inference in FP16 (GPU only)")
     args = parser.parse_args()
 
     video_path = ROOT / args.video
@@ -215,8 +236,11 @@ def main() -> None:
           f"{gt_object_count} unique person tracks.")
 
     for label, confidence in (("baseline (conf=0.25)", 0.25), ("custom (conf=0.35)", 0.35)):
-        print(f"\nRunning detection pass: {label} ...")
-        det_by_frame = run_detection_pass(video_path, args.start_frame, end_frame, confidence)
+        print(f"\nRunning detection pass: {label} [{args.model_path} on {args.device}, tracker={args.tracker}] ...")
+        det_by_frame = run_detection_pass(
+            video_path, args.start_frame, end_frame, confidence,
+            model_path=args.model_path, device=args.device, tracker=args.tracker, half=args.half,
+        )
         metrics = evaluate(gt_by_frame, det_by_frame, args.iou_threshold, model_input_scale=model_input_scale)
         print(f"=== {label} vs ground truth (IoU >= {args.iou_threshold}) ===")
         for key, value in metrics.items():

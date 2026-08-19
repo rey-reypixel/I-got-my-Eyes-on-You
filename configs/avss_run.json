@@ -1,4 +1,5 @@
 {
+  "_comment": "Explicit ROI config for AVSS 2007 footage. Replaces the previous filename-sniffing hack in src/detection.py (roi_polygon only applied if the source path contained the string 'AVSS') with an explicit opt-in: run with `python main.py --source \"data/raw/abandoned_objects/AVSS 2007/AVSSS07_EASY.mpg\" --config configs/avss_run.json`. The polygon below is the AVSS train-platform-edge safety boundary; it means nothing for any other camera view.",
   "roi_polygon": [
     [0.0, 0.0],
     [0.22, 0.0],
@@ -11,7 +12,7 @@
     "device": "cpu",
     "tracker": "bytetrack.yaml",
     "half": false,
-    "roi_enabled": false
+    "roi_enabled": true
   },
   "state_machine": {
     "th_frames": 10,
