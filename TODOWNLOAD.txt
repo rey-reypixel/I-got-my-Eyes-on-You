@@ -1,0 +1,118 @@
+TODOWNLOAD.txt -- everything needed on the GPU (B200) machine
+================================================================
+Setup checklist for continuing this project's IEEE-paper upgrade on the
+actual GPU hardware. Written 2026-08-19 on a machine with no GPU and no
+torch/ultralytics installed -- nothing GPU-dependent below has actually
+been run yet. Verify each item still applies before relying on it; software
+versions and download links both go stale.
+
+1. CLONE / SYNC THIS REPO
+--------------------------
+git clone <your fork/remote URL>
+cd I-got-my-Eyes-on-You
+
+NOTE: this local checkout's `main` and `origin/main` have DIVERGED (2 local
+commits, 2 remote commits, neither merged into the other). The 2 remote-only
+commits relicense the project to Business Source License 1.1. Reconcile
+this (git pull / merge, or decide which side wins) before doing anything
+else -- it was deliberately left alone rather than merged automatically,
+since a licensing change isn't something to resolve silently.
+
+2. NVIDIA DRIVER + CUDA TOOLKIT
+--------------------------------
+Confirm what's already on the machine:
+  nvidia-smi
+Note the "CUDA Version" it reports (the max CUDA version the installed
+driver supports). Blackwell-generation GPUs (B200) need a reasonably recent
+driver -- if nvidia-smi doesn't show the GPU or errors out, fix the
+driver/toolkit install first, before anything else on this list.
+
+3. PYTHON ENVIRONMENT
+----------------------
+python -m venv .venv
+(activate it, then continue below)
+
+4. PYTORCH -- INSTALL BEFORE requirements.txt, MATCHED TO YOUR CUDA VERSION
+------------------------------------------------------------------------------
+Check https://pytorch.org/get-started/locally/ for the current install
+command matching the CUDA version from step 2 -- do not assume a specific
+cuXXX wheel index is still current, PyTorch's supported CUDA versions
+change over time. General pattern (confirm the real index URL/version at
+install time, not from this file):
+  pip install torch torchvision --index-url https://download.pytorch.org/whl/<cuXXX>
+
+Verify the GPU is actually visible to PyTorch before continuing:
+  python -c "import torch; print(torch.cuda.is_available(), torch.cuda.get_device_name(0))"
+
+5. REMAINING PYTHON DEPENDENCIES
+----------------------------------
+pip install -r requirements.txt
+(ultralytics>=8.4.0, opencv-python, mcp, scipy, scikit-learn -- torch/
+torchvision already installed in step 4; this will leave them alone if they
+already satisfy the floor in requirements.txt)
+
+6. MODEL WEIGHTS -- AUTO-DOWNLOAD ON FIRST USE, NO MANUAL STEP NEEDED
+--------------------------------------------------------------------------
+Ultralytics downloads each of these automatically the first time it's
+loaded (needs internet access on the GPU machine, just for that first run):
+  - yolov8n.pt, yolov8n-pose.pt   -- already sitting in this repo's root
+                                      (CPU baseline, for before/after comparison)
+  - yolo26n.pt, yolo26n-pose.pt   -- new stack, configs/gpu_run.json's default
+  - yolo26s.pt, yolo26m.pt        -- only needed if you run
+                                      benchmark/model_sweep.py's default grid
+Re-verify yolo26 is still Ultralytics' current recommended model family
+before trusting this -- confirmed via a live PyPI/GitHub check on
+2026-08-19 (latest ultralytics was 8.4.123), but Ultralytics ships new
+model generations quickly and this list will age.
+
+The Re-ID tracker (configs/trackers/botsort_reid.yaml, with_reid: true)
+also auto-downloads a small appearance-embedding model the first time it's
+used -- again no manual step, just needs internet access that first time.
+
+7. EXTERNAL DATASET GROUND TRUTH -- MANUAL DOWNLOAD REQUIRED
+------------------------------------------------------------------
+CUHK Avenue ground-truth labels, needed for benchmark/avenue_auc_eval.py.
+NOT included in this checkout -- only the raw Avenue videos are (confirmed
+during project exploration: the video files are the complete, correct
+standard 16-train/21-test set, but the labels ship as a separate download).
+
+  URL (pulled directly from the anomalib open-source library's own source
+  code as of 2026-08-19, not guessed -- but it's an old academic department
+  page, so confirm it's still live before relying on it):
+    http://www.cse.cuhk.edu.hk/leojia/projects/detectabnormal/ground_truth_demo.zip
+
+  Extract it so the result is:
+    data/raw/suspicious_activities/Avenue Dataset/ground_truth_demo/testing_label_mask/*.mat
+
+  data/raw/ is gitignored -- this download will never show up in `git
+  status` and won't need repeating once it's on this machine's disk.
+
+8. OPTIONAL / DEFERRED -- NOT REQUIRED FOR THE CURRENT PLAN
+------------------------------------------------------------------
+Real future-work items, not needed to execute the plan as currently scoped:
+  - Full official UCF-Crime test split (140 Normal + 150 Anomaly videos)
+    plus Temporal_Anomaly_Annotation_for_Testing_Videos.txt -- only needed
+    if you want a full frame-level AUC-ROC protocol on UCF-Crime instead of
+    the lightweight activation/coverage check
+    benchmark/ucf_crime_pose_validation.py already does against the 450
+    clips already on disk. This is a large (~130GB) separate download;
+    only pursue it if you specifically want that upgrade later.
+  - ABODA ground-truth annotations -- the 11 ABODA videos already under
+    data/raw/ have NO ground truth at all in this checkout. Only needed if
+    ABODA is brought into the quantitative evaluation scope later (currently
+    it stays qualitative/bug-hunting only, same as before this upgrade).
+
+9. VERIFY BEFORE TRUSTING ANY NUMBER
+------------------------------------------------------------------
+  python -m unittest discover -s tests    (should show 80 passed)
+  python check.py
+
+Then follow README.md's "GPU Upgrade Path" section for the actual run
+commands (model sweep, AVSS/Avenue/UCF-Crime evaluators, threshold
+recalibration). Every new config/tracker choice added in this upgrade is
+explicitly marked PLACEHOLDER / not yet run in its own code comments --
+re-verify against real footage before citing any resulting number in the
+paper. That's not extra caution for its own sake -- it's the same
+discipline this project already applies everywhere else (see
+bugs_and_debugs.txt, 38 entries and counting, several of which are exactly
+"a fix that looked done until it was re-verified against real footage").
