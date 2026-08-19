@@ -47,3 +47,7 @@ data/sample_videos/
 # 5. Local Notebooks & Benchmarks Logs
 benchmarks/logs/
 .ipynb_checkpoints/
+
+# (☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)(☆▽☆)
+# 6. Generated runtime artifacts (regenerate via --event-log / benchmark scripts)
+*.db

@@ -1,0 +1,816 @@
+EyesOnYou: A State-Machine Reasoning Framework for Real-Time
+Multi-Objective CCTV Threat Detection and Real-Footage Validation
+
+[Author Name(s)]
+[Department, University]
+[City, Country]
+[email]
+
+NOTE TO SELF (remove before submission): author block above is a
+placeholder, matching the convention already used by this project's
+earlier drafts (see please_study.txt). Fill in real names/affiliations/
+emails before this goes anywhere.
+
+--------------------------------------------------------------------
+Abstract
+--------------------------------------------------------------------
+Real-time video surveillance systems built on off-the-shelf object
+detectors and multi-object trackers can report what is present in a
+frame and, with tracking, a persistent identity for it across frames --
+but neither component has any concept of a security-relevant state such
+as "unattended," "restricted," or "suspicious." Those are domain-
+specific reasoning concepts that must be built on top. This paper
+presents EyesOnYou, a lightweight state-machine reasoning layer over
+YOLOv8n detection and ByteTrack association that adds three such
+objectives: unauthorized-access detection via polygon region-of-interest
+containment, abandoned-object detection via a hysteresis-based
+dwell-time state machine, and suspicious-activity detection via a dual
+kinematic and gated pose-based limb-motion signal. Person-detection
+accuracy is evaluated against real VIRAT ground-truth annotations,
+yielding 75.8% precision and 54.9% recall (IoU >= 0.5) at realistic CCTV
+camera distance; the reasoning layer itself adds under 1% additional
+end-to-end latency (0.6 ms versus a detection cost of 106.2 ms). Beyond
+these results, this paper documents a structured validation of the
+system against six real-world surveillance datasets, identifying and
+correcting 37 defects -- including a state-priority bug capable of
+silently dropping an active intrusion alert beneath a simultaneous
+panic signal, a preprocessing distortion affecting every non-square
+video the pipeline had ever processed, and an identity-fragmentation-
+driven failure in which a genuinely abandoned object lost its alert
+entirely across a real, measured 649-frame (~21.6 second) detection
+gap -- each corrected and covered by a dedicated regression test in a
+66-test automated suite. Two further findings concern measurement
+validity rather than detection behavior: an internal benchmark
+comparison was found to implicitly exclude detection latency from one
+side of an efficiency claim, and a tracking-fragmentation metric was
+found to depend on a hardcoded, unverified assumption about scene
+object count; both are reported and corrected as methodology findings
+in their own right. These results indicate that, for a heuristic
+reasoning layer built on pretrained perception components, real-footage
+validation of the reasoning layer's own behavior is a necessary
+complement to -- and is not established by -- ground-truth accuracy of
+the underlying detector alone.
+
+Index Terms -- video surveillance, object detection, multi-object
+tracking, state-machine reasoning, abandoned-object detection,
+intrusion detection, anomaly detection, pose estimation, real-time
+systems
+
+--------------------------------------------------------------------
+I. Introduction
+--------------------------------------------------------------------
+Video surveillance remains the dominant tool for physical-security
+monitoring in public and semi-public spaces, but its effectiveness is
+bounded by the attention of a human operator watching one or many
+screens for long, largely uneventful stretches of time. This motivates
+continued research into systems that can pre-screen video for
+security-relevant events -- unauthorized entry into a restricted area,
+an object left unattended, or a person behaving anomalously -- and
+surface only those events for human review, rather than requiring
+constant human attention to raw footage.
+
+Modern object detectors such as the YOLO family answer a narrow
+question well: what is in this frame, and where. Modern multi-object
+trackers such as ByteTrack extend that answer across time: this object
+in frame N is probably the same physical object as the one in frame
+N-1. Neither component, on its own, has any concept of "attended,"
+"abandoned," "restricted," or "suspicious" -- these are domain-specific
+reasoning concepts that must be layered on top of raw detection and
+tracking output. This is the same architectural pattern used by most
+deployed commercial video-management-system (VMS) surveillance
+products: a shared perception foundation (detection plus tracking)
+feeding a set of independent, purpose-built reasoning modules, rather
+than one large end-to-end model trained to output security labels
+directly. The latter would require large volumes of labeled
+"abandoned object" or "suspicious activity" training data that does not
+exist at the scale needed, and would trade away the auditability of a
+rule-based reasoning layer, whose decision at any frame can be traced
+to a specific threshold and a specific input value, for the
+comparatively opaque decision surface of a learned end-to-end
+classifier.
+
+A second, comparatively underexamined problem in this domain is what
+happens once a reasoning layer built on top of a tracker is actually
+run against real, continuous video rather than short, curated clips.
+A tracker's per-frame association is not a stable identity: an object
+briefly occluded, or whose detection confidence dips for a single
+frame, can be silently reassigned a new track identity when it
+reappears, even though nothing about the underlying object has
+changed. A reasoning layer with state that accumulates over time --
+a dwell timer for an unattended bag, for instance -- is directly
+exposed to this instability in a way a single-frame detector is not:
+an identity that quietly changes mid-track can reset accumulated state
+to zero, or leave stale, unretired state behind under an ID that will
+never be seen again. Unlike a training/validation split, where every
+input the model will encounter is, by construction, already present
+and correctly formed, a live reasoning layer must contend with data
+irregularities -- ID churn, detection dropouts, non-square input video,
+manual playback seeking -- that a curated evaluation set does not
+surface. Identifying and correcting this class of defect, using real
+footage rather than synthetic test cases as the primary validation
+signal, is a central contribution of this paper.
+
+The contributions of this paper are summarized as follows.
+
+1) A real-time, three-objective CCTV reasoning layer (unauthorized-
+access, abandoned-object, and suspicious-activity detection) is
+presented, built entirely on off-the-shelf, pretrained YOLOv8n
+detection and ByteTrack association, requiring no additional labeled
+training data of its own.
+
+2) A structured, real-footage validation process is conducted across
+six public surveillance datasets, identifying and correcting 37
+defects (33 bugs, 2 features, 2 measurement-methodology corrections)
+spanning state-priority resolution, preprocessing distortion,
+identity-fragmentation-driven state loss, and benchmark-measurement
+validity, each backed by a dedicated regression test in a 66-test
+automated suite.
+
+3) Detection performance for the underlying perception stage is
+evaluated against real VIRAT ground-truth annotations via IoU-matched
+precision/recall, and the reasoning layer's own computational overhead
+is measured directly rather than assumed, showing under 1% additional
+end-to-end latency.
+
+4) A persisted, queryable event log and an MCP (Model Context Protocol)
+query layer are added to make a completed run's alert history
+queryable after the fact, with an explicit, precise statement of what
+is and is not yet connected to an actual language-model client.
+
+The remainder of this paper is organized as follows. Section II reviews
+related work. Section III describes the proposed system and its
+methodology. Section IV presents the real-footage validation process
+and its findings. Section V reports experimental results. Section VI
+discusses limitations, and Section VII concludes the paper and outlines
+directions for future work.
+
+--------------------------------------------------------------------
+II. Related Work
+--------------------------------------------------------------------
+Object detection underlying this work follows the single-stage
+detector lineage introduced by YOLO [1], which frames detection as a
+single regression over a grid of candidate boxes rather than a
+separate region-proposal stage, trading a small amount of accuracy for
+substantially higher throughput -- a trade-off well suited to a
+real-time CCTV pipeline running on commodity hardware. This work uses
+the YOLOv8n ("nano") variant specifically for its CPU-viable inference
+cost, at the expense of the recall on small/distant objects discussed
+in Section VI.
+
+Multi-object tracking in this domain is dominated by tracking-by-
+detection approaches, which associate each frame's detections into
+persistent identities rather than tracking pixels directly. ByteTrack
+[2], used in this work via its bundled integration with the detection
+library, associates low-confidence detection boxes rather than
+discarding them outright, which improves track continuity through
+partial occlusion relative to earlier SORT-lineage trackers that
+discard any detection below a confidence cutoff. Like the SORT lineage
+generally, ByteTrack's base configuration associates detections purely
+by motion prediction (a Kalman filter) and bounding-box overlap (IoU),
+without an appearance-based re-identification (Re-ID) component --
+a limitation this paper returns to directly in Sections IV, VI, and
+VII, since it is the single most recurring root cause of the defects
+documented in Section IV.
+
+Abandoned/left-behind object detection is a long-studied problem in
+video surveillance. Luna et al. [5] survey the field and organize prior
+approaches into the same three stages this paper's Objective 2 mirrors
+at a higher level of abstraction: foreground/stationary-region
+detection, owner/person association, and abandonment verification.
+Lin et al. [6] address the specific failure mode of premature or missed
+abandonment verification by combining short- and long-term background
+models with back-traced owner-trajectory analysis before committing to
+an "abandoned" classification -- a temporal-consistency concern
+directly analogous to the hysteresis mechanism this paper uses (Section
+III-C) to avoid flicker at the disconnect/reconnect boundary, though
+implemented via tracked-identity state rather than pixel-region state,
+which allows the mechanism to travel with a specific tracked object
+rather than a fixed region of the frame.
+
+Restricted-zone or "virtual tripwire" intrusion detection, in which a
+user-defined region or line in the camera frame is monitored for
+crossing or containment, traces to the geometric event-reasoning
+components of early automated surveillance systems such as the CMU
+VSAM project [7], and remains a standard technique in commercial VMS
+surveillance software today. This paper's Objective 1 (Section III-B)
+implements the region-containment variant of this idea via point-in-
+polygon testing rather than line-crossing.
+
+Suspicious or anomalous human activity recognition spans a wide range
+of approaches, from handcrafted kinematic and optical-flow anomaly
+measures to learned spatio-temporal action-recognition models. A
+sub-line of this work uses body-keypoint (pose) estimation as an
+intermediate representation for downstream action or violence
+classification, following the general approach popularized by
+multi-person 2D pose estimation methods [3]. Mittal et al.'s DIFEM [8]
+is a recent instance of this idea specific to violence recognition,
+extracting skeleton keypoints and their inter-frame velocities as a
+discriminative feature for a video-level violence classifier. This
+work's gated limb-motion signal (Section III-D) follows the same
+intermediate-representation idea in a lightweight, selectively-invoked
+form -- a rolling variance of keypoint motion rather than a learned
+classifier -- rather than running full pose-based action recognition on
+every person, every frame.
+
+The ground-truth dataset used for the person-detection evaluation in
+Section V is VIRAT [4], which provides frame-level annotated bounding
+boxes for people and vehicles across realistic, unstaged surveillance
+scenes recorded at varying camera distances -- a property this work
+relies on directly to evaluate detection accuracy separately at
+moderate and wide-overview camera distances (Section V-A).
+
+--------------------------------------------------------------------
+III. Proposed Methodology
+--------------------------------------------------------------------
+The system processes each video frame through a single linear
+pipeline that fans out into three independent reasoning objectives
+sharing one perception foundation (Fig. 1): letterbox preprocessing,
+YOLOv8n detection with ByteTrack association, per-objective state-
+machine reasoning, visual overlay rendering, and an optional persisted
+event-log write. Two in-memory, thread-safe dictionaries hold all
+per-frame state: one keyed by tracked-person identity, one keyed by
+tracked-object (bag) identity. In-memory storage was chosen over a
+database for this live state specifically because it is read and
+written many times per second; a database round-trip at that frequency
+would dominate the latency budget for no benefit. Every tracked
+identity accumulates a "stale" counter, incremented on any frame it is
+not redetected and reset to zero when it is; once that counter exceeds
+a configured threshold the identity is evicted from memory, which
+bounds memory growth for a continuously running, 24/7 deployment
+without an explicit maximum-track-count limit.
+
+A. Detection and Tracking Foundation
+Each frame is passed through YOLOv8n object detection restricted to
+the four relevant COCO classes (person, backpack, handbag, suitcase),
+with ByteTrack association enabled in persistent mode so that track
+identities carry across frames rather than being reassigned each call.
+This foundation is shared, unmodified, by all three reasoning
+objectives below -- none of them re-run detection or tracking
+independently.
+
+B. Objective 1: Unauthorized-Access Detection
+A user-configured polygon defines a restricted region of the frame.
+Every tracked person's foot coordinate -- the horizontal box center
+and the vertical box edge closest to the ground, rather than the box
+center or top -- is tested against this polygon every frame using the
+classical ray-casting (even-odd rule) point-in-polygon test: a
+horizontal ray is cast from the test point, and the parity of the
+number of polygon edges it crosses determines containment. The foot
+coordinate is used specifically because it is the actual ground-
+contact point; a person's box center drifts with how much of their
+body a detector happens to capture (partial occlusion, frame-edge
+clipping), while their head, well above a ground-level zone boundary,
+is not informative about whether they are standing inside it. This
+test is recomputed independently every frame with no memory of the
+previous frame's result, since entering or exiting a restricted zone
+should be reflected the instant it happens, unlike Objective 2 below,
+which deliberately does retain state across frames (Fig. 2).
+
+C. Objective 2: Abandoned-Object Detection
+Every tracked bag (backpack, handbag, or suitcase) is modeled as a
+three-state machine: ATTENDED, WARNING, and ABANDONED (Fig. 3). The
+Euclidean distance between a bag and its nearest tracked person is
+compared against two different thresholds depending on direction of
+transition -- a larger disconnect threshold to leave ATTENDED and
+start a dwell timer, and a smaller reconnect threshold to cancel
+WARNING or ABANDONED and return to ATTENDED. Using two thresholds
+rather than one implements hysteresis: a single shared threshold would
+let a person standing near that exact distance cause the state to
+flicker every frame from ordinary tracking jitter, the same principle
+by which a thermostat uses separate on/off setpoints rather than one.
+Both thresholds are additionally scaled by the nearest person's own
+detected bounding-box height, which acts as a cheap proxy for camera
+depth: a fixed pixel distance means something very different for a
+person near the camera (large box) than for one far from it (small
+box), and scaling by the person's own apparent size approximately
+compensates for this without requiring camera calibration or
+homography.
+
+Distinguishing a carried bag from a placed one uses a lightweight
+vertical heuristic -- a bag closer, vertically, to a person's torso
+than to their feet is judged carried, the opposite judged placed --
+combined with a motion-stability check: a bag classified carried is
+re-classified placed if its own position has not actually displaced
+over a short recent window, since a bag genuinely riding with a moving
+person displaces frame to frame and a bag resting on the floor does
+not, regardless of what the single-frame vertical heuristic reports
+that frame. This second, independent signal is a direct outcome of the
+real-footage validation described in Section IV-D.
+
+D. Objective 3: Suspicious-Activity Detection
+Two independent signals are combined into one alert (Fig. 4). The
+first is kinematic: frame-to-frame centroid displacement is normalized
+by the person's own detected height (the same perspective-compensation
+principle as Section III-C) and evaluated as a statistical outlier
+against a rolling baseline of that same person's own recent velocity,
+subject to an absolute floor that prevents near-zero jitter from
+registering as a large relative spike while a person is standing
+still.
+
+The second signal targets a blind spot the first cannot see: a person
+who is stationary overall but whose limbs are moving violently --
+fighting, vandalism, shoplifting -- produces zero centroid
+displacement and is therefore invisible to kinematic analysis alone.
+Running full pose estimation on every tracked person, every frame,
+would approximately double inference cost for a signal only useful in
+this specific, comparatively rare situation, so this signal is gated:
+a person accumulates a "stationary" counter while not kinematically
+suspicious, and only once that counter crosses a configured threshold
+is a lazily-loaded pose model invoked for that person, that frame.
+When invoked, the rolling variance (not raw distance, since an unusual
+but static pose should not itself register as suspicious) of
+wrist/elbow keypoints relative to a torso reference point, height-
+normalized and confidence-gated per keypoint, is smoothed via an
+exponential moving average and thresholded into a limb-motion flag.
+Using body-keypoint motion as a discriminative temporal signal in this
+way has precedent outside the surveillance setting: Rahatwal et al. [9]
+fuse facial features with body-keypoint dynamics extracted via a
+lightweight pose model, combined through a CNN-Transformer network, to
+detect deepfake video -- a different task, but the same underlying
+premise that keypoint-derived body-motion dynamics carry a
+discriminative signal beyond what appearance features alone capture,
+which this paper applies to the narrower, single-signal case of
+flagging elevated limb motion during sustained centroid stillness.
+
+Both signals, together with the unauthorized-access flag from Section
+III-B and a panic flag maintained separately from the kinematic
+signal with an explicit cooldown-based recovery path, are resolved
+into a single displayed label once per frame by a fixed priority order
+(INTRUDER > PANIC > SUSPICIOUS_ACTIVITY > NORMAL) rather than each
+detector writing directly to one shared field, which -- as documented
+in Section IV-A -- previously allowed a higher-priority alert to be
+silently overwritten by a lower-priority one firing in the same frame.
+
+E. Preprocessing: Aspect-Ratio-Preserving Letterbox Resizing
+Every frame is resized to the detector's square input resolution
+before inference. This is done via a letterbox transform -- scale the
+frame so its longer side exactly fits the target size, then center the
+result on a padded square canvas -- rather than independently scaling
+width and height to fill the square, which anisotropically distorts
+human proportions on any non-square source video (Fig. 5; a 320x240
+frame naively stretched to 640x640, for instance, is stretched 2.0x
+horizontally but 2.667x vertically). This transform is shared by the
+live pipeline and both benchmark evaluation scripts, so that a
+baseline-vs-reasoning-layer comparison isolates the reasoning layer
+itself rather than incidentally also comparing preprocessing quality
+between the two.
+
+F. Identity-Fragmentation-Resilient State Recovery
+Because the underlying tracker performs no appearance-based re-
+identification, a stationary tracked bag can be silently reassigned a
+new track identity on any brief occlusion or confidence dip, which
+would otherwise reset its accumulated dwell timer to zero. When a new
+bag identity appears, the system first searches existing tracked (but
+not currently active) bag entries, and a short-lived buffer of bags
+evicted moments earlier, within a small pixel radius of the new
+detection (Fig. 6); if a match is found, the new identity inherits the
+matched entry's accumulated state and timer rather than starting over.
+This heuristic is safe specifically because a physical bag does not
+relocate on its own -- two different bags coincidentally appearing at
+nearly the same pixel position moments apart is effectively
+impossible -- and is deliberately not applied on the person side, where
+two different people crossing the same point in the frame is an
+ordinary occurrence.
+
+G. Persisted Event Log and MCP Query Layer
+Live tracking state exists only in memory and does not survive process
+termination. An optional SQLite-backed event log records one row for
+every frame in which a tracked person's or bag's displayed state
+actually changes (both new alerts and recoveries back to a normal
+state), scoped to a run identifier. A separate, standalone process
+exposes four read-only query tools -- list recorded runs, list alert
+events (filterable by run, state, and time range), retrieve the full
+state-transition history of one specific tracked entity, and summarize
+a run's alert counts -- over this same SQLite file via the Model
+Context Protocol (MCP), using the reference Python MCP SDK's decorator-
+based tool registration (Fig. 7). This query process shares no thread
+or process with the live video loop by design: the live pipeline's
+frame loop is a tight, blocking loop, while an MCP server is
+conventionally asynchronous, and interleaving the two safely in one
+process would require a genuine concurrency redesign for no benefit
+over two independent processes that share only a file on disk. To be
+precise about what this component does and does not demonstrate: the
+tool layer itself is genuinely protocol-compliant and returns correct
+results when called, verified against a real recorded run rather than
+synthetic data; no language-model client has, as of this writing,
+actually been connected to it to reason over which tool to call in
+response to a natural-language question. This is reported as an
+explicit scope boundary rather than left ambiguous.
+
+--------------------------------------------------------------------
+IV. Real-Footage Validation and Defect Correction
+--------------------------------------------------------------------
+Every defect reported in this section was found and confirmed using
+the same iterative process, illustrated in Fig. 8: a symptom is either
+reproduced with a targeted synthetic scenario or observed directly on
+real footage; where real footage is involved, the pipeline is
+instrumented frame-by-frame against that footage -- not inspected
+visually alone -- to identify the actual mechanism; a fix is
+implemented and covered by a dedicated regression test; and the fix is
+then re-verified against the same real footage, not merely against the
+unit-test suite, before being accepted as complete. This loop matters
+concretely: finding D below was corrected once, believed sufficient
+after passing its regression tests, and was twice found insufficient
+at the real-footage re-verification step, requiring a second and then
+a third root-cause pass before the actual distinguishing signal was
+identified. A synthetic-test-only workflow would plausibly have
+shipped each interim fix as complete.
+
+A. State-Priority Resolution
+Finding: the four independent conditions capable of raising an alert
+for a tracked person (restricted-zone containment, panic, kinematic
+suspicious motion, limb-motion suspicious activity) originally wrote
+directly to one shared display-state field with no defined precedence
+between them, and a panic flag, once set, had no path back to a normal
+state. An active unauthorized-access alert could therefore be silently
+replaced by a simultaneous panic or suspicious-activity flag firing on
+the same frame, and a single transient panic spike would leave a track
+permanently labeled as panicking for the remainder of its lifetime.
+Resolution: each detector now writes to its own independent flag; the
+single displayed label is resolved once per frame by a fixed priority
+order (INTRUDER > PANIC > SUSPICIOUS_ACTIVITY > NORMAL), and the panic
+flag recovers automatically via an explicit cooldown counter rather
+than latching indefinitely.
+
+B. Behavioral-Signal Substitution
+Finding: the smoothing path feeding the suspicious-activity display
+state was originally invoked with the underlying detector's own
+person-classification confidence score, rather than any actual
+behavior or anomaly signal -- meaning it fired whenever a person was
+clearly and consistently detected for long enough, independent of
+what they were doing, and independently competed with the kinematic
+signal for the same display field.
+Resolution: this call site was replaced with a real behavior signal --
+the gated, pose-based limb-motion variance score described in Section
+III-D -- writing to its own independent flag rather than the shared
+field directly.
+
+C. Preprocessing Distortion Across Non-Square Video
+Finding: frames were resized to the detector's square input resolution
+via an unconditional, independent-axis stretch, discovered while
+validating the pose-based signal against a real 4:3-aspect-ratio clip,
+in which people were not detected at several points in the video. As
+established in Section III-E, this distortion affected every non-
+square source video the pipeline had processed up to that point, which
+covers most of the surveillance datasets used in this work.
+Resolution: replaced with the aspect-ratio-preserving letterbox
+transform described in Section III-E, applied consistently across the
+live pipeline and both benchmark evaluation scripts.
+
+D. Identity-Fragmentation-Driven State Loss
+Finding: direct frame-by-frame instrumentation against a real clip
+found one physical, stationary bag reassigned seven different track
+identities within approximately four seconds, and, separately, a
+genuinely abandoned bag that went undetected by the underlying
+detector for 649 consecutive frames (~21.6 seconds) -- an order of
+magnitude beyond every persistence and eviction threshold then
+configured, causing its alert to be lost entirely rather than merely
+delayed. An interim fix that widened those thresholds to bridge the
+observed gap was re-verified against the same clip and found to
+produce no visible change, because a separate, more aggressive
+eviction path -- specific to bags currently classified "carried" --
+was evicting the entry outright before the widened thresholds were
+ever consulted. Widening that path's own threshold in turn introduced
+the opposite failure on a second real clip: a bag genuinely carried
+away by its owner, leaving the frame with them, was retained long
+enough to render a false "abandoned" alert after the owner had already
+left.
+Resolution: rather than continuing to enlarge timeout values, a
+genuine distinguishing signal was added -- each bag tracks a short
+recent-position history, and a bag believed carried is reclassified
+placed if it has not actually displaced over that window, regardless
+of what the single-frame vertical heuristic (Section III-C) reports
+that frame. This directly explains the original 649-frame case: the
+bag was stationary the entire time and had been misclassified
+"carried" from incidental camera-perspective alignment, not genuinely
+carried at all. With that misclassification corrected at its source,
+the aggressive carried-bag eviction path's own grace window could be
+returned to a short value, resolving both the false-negative and the
+false-positive pattern with a single added signal. This is combined
+with the proximity-scoped state-recovery mechanism of Section III-F
+and a short-lived recovery buffer for bags evicted outright while
+still briefly reacquirable.
+
+E. Benchmark Latency Measurement Validity
+Finding: an internal benchmark intended to demonstrate the reasoning
+layer's efficiency measured the baseline configuration's complete
+detection-plus-tracking latency, but measured only the reasoning
+layer's own execution time on the engineered configuration, excluding
+the (identical, unavoidable) detection cost from that side's timer
+entirely. Sanity-checking this comparison before citing it produced a
+baseline figure of 0.1062 s (9.4 FPS) against a reasoning-layer-only
+figure of 0.0006 s (1707 FPS) -- numbers that, read naively as an
+end-to-end comparison, would support a false and indefensible
+"approximately 180x faster" claim.
+Resolution: the comparison was reframed as what it actually
+demonstrates: the reasoning layer adds approximately 0.6 ms on top of
+the unavoidable ~106.2 ms detection cost, under 1% additional
+end-to-end latency (Section V-B), and the original framing was
+explicitly flagged so it is not reused in later reporting.
+
+F. Ground-Truth-Free Fragmentation Metric
+Finding: a tracking-fragmentation ("identity switches") metric was
+computed as the number of unique track identities observed minus a
+hardcoded assumed scene object count of five, rather than a count
+derived from the video itself. Visual inspection of a real evaluation
+clip found at least six to seven distinct people visible in a single
+frame alone, invalidating the assumption for that clip and making the
+resulting number not meaningful as computed for it.
+Resolution: not patched in place, since no in-place patch removes a
+hardcoded assumption's fundamental dependence on being correct; instead
+a dedicated evaluation harness was built against real per-frame VIRAT
+object annotations (Section V-A), replacing the assumed-count heuristic
+with an IoU-matched precision/recall/identity-switch computation for
+any video that ships genuine ground-truth annotations.
+
+G. Manual-Seek State Corruption
+Finding: rewind and skip playback controls advanced the underlying
+video capture position directly but left both the tracker's own
+internal motion-prediction state and this system's own tracking
+bookkeeping untouched, despite both being built on an assumption of
+continuous, monotonically increasing frame input. A manual seek
+visibly corrupted bounding boxes and their persistence after every
+rewind or skip during real use.
+Resolution: a dedicated reset routine, invoked from every rewind/skip
+control site, clears all in-memory tracking state and additionally
+invokes the underlying tracker's own internal reset, so that tracking
+restarts cleanly from wherever the video position lands rather than
+carrying over stale predictions from before the jump.
+
+TABLE I. SUMMARY OF REAL-FOOTAGE VALIDATION FINDINGS
+--------------------------------------------------------------------
+Area                    | Finding                    | Resolution
+--------------------------------------------------------------------
+State-priority           | Alerts written to one      | Independent
+resolution (A)            | shared field with no       | flags, fixed
+                          | precedence; could drop     | priority order
+                          | an active intrusion alert  | per frame
+--------------------------------------------------------------------
+Behavioral signal (B)    | Suspicious-activity path   | Replaced with
+                          | fed detection confidence,  | real pose-based
+                          | not a behavior signal      | limb-motion score
+--------------------------------------------------------------------
+Preprocessing (C)        | Naive stretch-resize        | Aspect-ratio-
+                          | distorted every non-square | preserving
+                          | source video                | letterbox resize
+--------------------------------------------------------------------
+Identity fragmentation   | Stationary bag reassigned 7 | Proximity-scoped
+/ state loss (D)         | IDs in ~4s; a genuinely     | state recovery +
+                          | abandoned bag lost its      | motion-stability
+                          | alert across a real 649-    | reclassification
+                          | frame (~21.6s) gap          | signal
+--------------------------------------------------------------------
+Benchmark latency         | Efficiency comparison        | Reframed to a
+validity (E)              | silently excluded detection  | defensible <1%
+                          | cost from one side           | overhead figure
+--------------------------------------------------------------------
+Fragmentation metric      | "Identity switches" computed | Real VIRAT
+validity (F)              | against a hardcoded assumed  | ground-truth-
+                          | object count of five          | based evaluator
+--------------------------------------------------------------------
+Manual-seek corruption    | Rewind/skip left tracker and | Full state
+(G)                       | own bookkeeping stale after  | reset, including
+                          | a discontinuous frame jump   | the tracker itself
+--------------------------------------------------------------------
+
+--------------------------------------------------------------------
+V. Experimental Results
+--------------------------------------------------------------------
+A. Person-Detection Accuracy Against Ground Truth
+Person-detection accuracy was evaluated against real, frame-level
+VIRAT ground-truth bounding-box annotations using greedy, descending-
+IoU matching at an IoU threshold of 0.5, comparing the baseline
+detection-confidence threshold (0.25) against the engineered
+configuration's threshold (0.35). Two camera-distance regimes were
+evaluated separately, since they produce materially different results.
+
+TABLE II. PERSON-DETECTION ACCURACY AGAINST VIRAT GROUND TRUTH
+--------------------------------------------------------------------
+Clip type          | Configuration        | Recall  | Precision
+--------------------------------------------------------------------
+Moderate distance   | Baseline (conf=0.25) | 56.4%   | [re-verify]
+Moderate distance   | Engineered (conf=0.35)| 54.9%  | 75.8%
+Wide overview        | Baseline (conf=0.25) | 5.6%    | [re-verify]
+Wide overview        | Engineered (conf=0.35)| 3.5%   | [re-verify]
+--------------------------------------------------------------------
+[re-verify]: not carried forward with a verified source figure into
+this draft; re-run benchmark/evaluate_against_ground_truth.py against
+the same clips before citing a specific value in a final version rather
+than estimating one.
+
+At moderate camera distance, the engineered configuration's higher
+confidence threshold trades a small amount of recall (56.4% to 54.9%)
+for substantially higher precision (75.8%), consistent with the
+expected effect of raising a detector's confidence threshold. Both
+configurations degrade sharply at wide-overview camera distance, where
+93.5% of ground-truth people occupy fewer than 40 pixels of height in
+the detector's own input space -- a known, general limitation of
+"nano"-scale detection models on small, distant objects (Section VI)
+rather than a defect specific to the reasoning layer evaluated in this
+paper. Using the same VIRAT-based evaluator, 3 identity switches were
+observed against 3 ground-truth tracks over an approximately five-
+minute evaluation clip.
+
+B. Latency and Throughput
+TABLE III. REASONING-LAYER COMPUTATIONAL OVERHEAD
+--------------------------------------------------------------------
+Component                                    | Latency  | Share
+--------------------------------------------------------------------
+YOLOv8n detection + ByteTrack association     | 106.2 ms | >99%
+State-machine reasoning layer (all 3          | 0.6 ms   | <1%
+objectives combined)
+--------------------------------------------------------------------
+Combined CPU throughput                       | ~9.4 FPS |
+--------------------------------------------------------------------
+As established in Section IV-E, this figure supersedes an earlier,
+methodologically invalid internal comparison and should be read
+specifically as: the reasoning layer adds negligible overhead on top
+of an unavoidable detection cost, not as a claim about the reasoning
+layer's standalone throughput in isolation. The combined ~9.4 FPS
+throughput is discussed as a limitation in Section VI.
+
+C. Defect-Discovery Summary
+Across the validation process described in Section IV, 37 defects were
+identified and corrected (33 bugs, 2 features, 2 measurement-
+methodology corrections), each covered by a dedicated regression test
+in a 66-test automated suite, using real footage drawn from six public
+surveillance datasets (VIRAT, CDnet, ABODA, AVSS 2007, UCF-Crime, and
+the Avenue dataset) in addition to targeted synthetic test scenarios.
+
+--------------------------------------------------------------------
+VI. Discussion and Limitations
+--------------------------------------------------------------------
+The single most consequential limitation of the underlying tracker is
+the absence of appearance-based re-identification: track identity is
+not stable across occlusion or pose change, measured directly at 3
+identity switches against only 3 ground-truth tracks in one evaluation
+clip (Section V-A). Every defect described in Section IV-D traces back
+to this single root cause manifesting differently in different
+contexts, and the family of mitigations built to address it
+(proximity-scoped recovery, a short-lived echo buffer, a motion-
+stability reclassification signal) each patch one specific failure
+mode of the same underlying gap rather than the gap itself.
+
+A direct consequence of this same gap is that owner identity is not
+verified anywhere in the abandoned-object objective: any nearby
+person, not necessarily the bag's true owner, can currently clear an
+ABANDONED alert back to ATTENDED, and the stored owner identity itself
+drifts to whichever tracked person is currently closest rather than
+representing a stable, verified identity. This is a deliberate,
+documented trade-off rather than an oversight: requiring an exact
+owner-identity match, given that the true owner's own track identity
+is subject to the same churn, would cause the system to fail to
+recognize its rightful owner returning -- a worse failure mode than the
+current, more permissive behavior.
+
+Detection recall degrades sharply at wide-overview camera distances,
+where the majority of tracked people occupy a very small fraction of
+the detector's input resolution (Section V-A); this is a known,
+general property of small ("nano") detection models on small or
+distant objects rather than a limitation specific to this paper's
+reasoning layer, but it directly constrains which camera placements
+the system is currently reliable for.
+
+The pose-based suspicious-activity signal (Section III-D) is
+architecturally complete and covered by unit tests using synthetic
+keypoint data, but has not, as of this writing, been empirically
+confirmed to fire correctly on real violent or altercation footage; its
+numeric thresholds are unvalidated defaults rather than calibrated
+values, and should be treated accordingly until such validation is
+performed.
+
+Only the person-detection stage underlying Objective 1 has a
+quantitative, ground-truth-backed accuracy figure (Section V-A).
+Objectives 2 and 3 (abandoned-object and suspicious-activity detection)
+were validated qualitatively, through real-video testing and defect-
+driven fixing as described in Section IV, rather than against an
+equivalent frame-level or event-level ground truth; this distinction
+is stated explicitly here rather than left to be inferred, since the
+two forms of validation are not interchangeable evidence.
+
+Separately, the root cause of the 649-frame real detection gap
+identified in Section IV-D -- specifically, why the underlying detector
+failed to detect a stationary, unoccluded backpack for over 21 seconds
+-- was not established in this work. The system was made to tolerate
+that gap once it occurs; none of the fixes in Section IV-D explain why
+it occurred in the first place, and this is reported as an open
+question rather than an implicitly resolved one.
+
+Finally, combined CPU-only throughput of approximately 9.4 FPS is
+below a conventional real-time video target of 24-30 FPS; the system
+as evaluated in this paper is a functional prototype rather than a
+production-ready real-time deployment.
+
+--------------------------------------------------------------------
+VII. Conclusion and Future Work
+--------------------------------------------------------------------
+This paper presented EyesOnYou, a state-machine reasoning layer adding
+three security objectives -- unauthorized access, abandoned-object, and
+suspicious-activity detection -- on top of off-the-shelf YOLOv8n
+detection and ByteTrack association, requiring no additional labeled
+training data of its own. Person-detection accuracy against real VIRAT
+ground truth reached 75.8% precision and 54.9% recall at realistic
+camera distance, and the reasoning layer itself was measured to add
+under 1% additional end-to-end latency. Beyond these results, a
+structured, real-footage validation process identified and corrected
+37 defects spanning state-priority resolution, preprocessing
+correctness, identity-fragmentation-driven state loss, and the
+validity of two of the paper's own internal measurements, each backed
+by a regression test in a 66-test automated suite. Taken together,
+these findings support this paper's central claim: for a heuristic
+reasoning layer built on pretrained perception components, ground-
+truth accuracy of the underlying detector is necessary but not
+sufficient evidence that the reasoning layer built on top of it behaves
+correctly once exposed to continuous, real-world video, and validating
+that reasoning layer against real footage warrants the same evaluation
+rigor conventionally reserved for detection accuracy alone.
+
+Future work includes the following directions.
+
+- Upgrading the underlying tracker to an appearance-based re-
+  identification-capable configuration (e.g. an available tracker
+  backend supporting an optional Re-ID embedding mode), which would
+  address the root cause common to the majority of findings in Section
+  IV-D rather than continuing to patch its individual symptoms. Every
+  distance and timing threshold in the reasoning layer was calibrated
+  against the current tracker's specific behavior and would require
+  re-verification against real footage after such a change.
+- Empirical calibration of the pose-based limb-motion thresholds
+  (Section III-D) against confirmed real altercation footage, to move
+  that signal from architecturally complete to empirically validated.
+- Evaluating a larger detector variant or a higher input resolution to
+  address the wide-overview recall limitation identified in Section
+  VI, with the resulting latency cost measured explicitly rather than
+  assumed acceptable.
+- Constructing event-level ground truth for Objectives 2 and 3, using
+  annotation types that map cleanly onto each objective rather than
+  reusing an annotation designed for a conceptually different event
+  category.
+- Owner-identity-gated abandoned-object reconnection, built on top of
+  the re-identification upgrade above rather than as a standalone
+  identity check on top of identities that are not yet stable.
+- Investigating the still-unexplained root cause of the 649-frame real
+  detection gap identified in Section IV-D and discussed in Section VI.
+- Camera calibration or homography-based true real-world distance
+  correction, to replace the current height-scaled pixel-distance
+  heuristics used throughout Section III with an actual metric
+  distance estimate.
+
+--------------------------------------------------------------------
+References
+--------------------------------------------------------------------
+[1] G. Jocher, A. Chaurasia, and J. Qiu, "Ultralytics YOLOv8," 2023.
+    [Online]. Available: https://github.com/ultralytics/ultralytics
+
+[2] Y. Zhang, P. Sun, Y. Jiang, D. Yu, F. Weng, Z. Yuan, P. Luo, W. Liu,
+    and X. Wang, "ByteTrack: Multi-Object Tracking by Associating Every
+    Detection Box," in Proc. European Conf. on Computer Vision (ECCV),
+    2022.
+
+[3] Z. Cao, T. Simon, S.-E. Wei, and Y. Sheikh, "Realtime Multi-Person
+    2D Pose Estimation using Part Affinity Fields," in Proc. IEEE Conf.
+    on Computer Vision and Pattern Recognition (CVPR), 2017.
+
+[4] S. Oh et al., "A Large-Scale Benchmark Dataset for Event Recognition
+    in Surveillance Video," in Proc. IEEE Conf. on Computer Vision and
+    Pattern Recognition (CVPR), 2011.
+
+[5] E. Luna, J. C. San Miguel, D. Ortego, and J. M. Martinez, "Abandoned
+    Object Detection in Video-Surveillance: Survey and Comparison,"
+    Sensors, vol. 18, no. 12, p. 4290, 2018, doi: 10.3390/s18124290.
+
+[6] K. Lin, S.-C. Chen, C.-S. Chen, D.-T. Lin, and Y.-P. Hung,
+    "Abandoned Object Detection via Temporal Consistency Modeling and
+    Back-Tracing Verification for Visual Surveillance," IEEE Trans. on
+    Information Forensics and Security, vol. 10, no. 7, pp. 1359-1370,
+    Jul. 2015.
+
+[7] R. T. Collins, A. J. Lipton, T. Kanade, H. Fujiyoshi, D. Duggins,
+    Y. Tsin, D. Tolliver, N. Enomoto, O. Hasegawa, P. Burt, and
+    L. Wixson, "A System for Video Surveillance and Monitoring," Tech.
+    Report CMU-RI-TR-00-12, Robotics Institute, Carnegie Mellon
+    University, May 2000.
+
+[8] H. Mittal, S. Basak, and A. Gautam, "DIFEM: Key-Points Interaction
+    Based Feature Extraction Module for Violence Recognition in
+    Videos," arXiv:2412.05386, 2024.
+
+[9] K. P. Rahatwal, S. Pundir, M. Wazid, and K. V. Bhat, "A Novel
+    Approach to Deepfake Detection: Leveraging Fused Facial and Body
+    Dynamics With a CNN-Transformer Hybrid Network," IEEE Access, 2025,
+    doi: 10.1109/ACCESS.2025.3632155.
+
+[NOTE: References [5]-[9] were sourced via a short, targeted web search
+(title/authors/venue cross-checked against at least two independent
+listings each) rather than a full systematic literature review or
+direct access to each paper's text -- spot-check bibliographic details
+(page numbers, exact author order) against the publisher's own record
+before final submission. [1]-[4] carry the same caveat from the
+previous revision of this draft. Reference [9] is included specifically
+because it is Dr. Mohammad Wazid's own recent work and is genuinely
+topically adjacent (keypoint/body-dynamics motion as a discriminative
+signal via a lightweight pose model) rather than cited only for the
+co-authorship connection; Section III-D states plainly that its
+application (deepfake detection) differs from this paper's (suspicious-
+activity detection) so the citation is not overstated as more directly
+related than it is.]
