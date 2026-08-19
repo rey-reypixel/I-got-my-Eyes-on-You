@@ -618,3 +618,24 @@ SURVEILLANCE PIPELINE BUGS AND DEBUGS LOG
 - Covered by tests/test_seek_reset.py: confirms tracked_people/tracked_bags are cleared, confirms
   the underlying tracker's `.reset()` is actually invoked (via a mock), and confirms the call is
   safe both before any model has been loaded and before the predictor has any trackers attached yet.
+
+38. BUG: Malformed Ground-Truth XML in the Downloaded AVSS 2007 Dataset (Missing Closing Tag)
+-----------------------------------------------------------------------------------------------
+- Root Cause: While building benchmark/avss_ground_truth.py (the event-level evaluator for
+  Objective 2, closing the paper's own admitted "only Objective 1 has quantitative ground truth"
+  gap), the new ViPER-GT XML parser was run against all three real AVSS 2007 clips already present
+  under data/raw/ as a verification step, not just against synthetic fixtures -- the same
+  real-data-first discipline behind most of this log. AVSSS07_EASY.txt and AVSSS07_HARD.txt parsed
+  cleanly; AVSSS07_MEDIUM.txt raised `xml.etree.ElementTree.ParseError: mismatched tag: line 24`.
+  Direct inspection found the downloaded file's `<descriptor name="StolenObject" type="OBJECT">`
+  element inside `<config>` was missing its closing `</descriptor>` tag before `</config>` --
+  genuinely malformed XML in the source dataset file itself, not a parser bug. The exact same
+  descriptor is correctly closed in both EASY and HARD's copies of this file, so this was a
+  one-off corruption in this specific downloaded copy, not a property of the AVSS format itself.
+- Fix: Added the missing `</descriptor>` tag directly to
+  `data/raw/abandoned_objects/AVSS 2007/AVSSS07_MEDIUM.txt` (gitignored external data, not
+  a tracked source file, so this is a local data-hygiene fix, not a code change) so it matches
+  the schema its own sibling clips already follow correctly.
+- Covered by tests/test_avss_ground_truth.py::AvssRealDataSmokeTest (skipped gracefully if the
+  dataset isn't present, e.g. on a fresh clone before data/raw is populated), which parses all
+  three real clips and would have caught this regressing again.
